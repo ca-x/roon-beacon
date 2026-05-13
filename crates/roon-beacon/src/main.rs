@@ -6,8 +6,8 @@
 use anyhow::{Context, Result};
 use axum::{
     extract::State,
-    http::StatusCode,
-    response::Html,
+    http::{header, StatusCode},
+    response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
 };
@@ -237,6 +237,27 @@ async fn web_index() -> Html<&'static str> {
     Html(WEB_UI_HTML)
 }
 
+async fn web_styles() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        WEB_UI_CSS,
+    )
+}
+
+async fn web_script() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        WEB_UI_JS,
+    )
+}
+
+async fn web_favicon() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
 async fn api_status(State(state): State<WebState>) -> Json<StatusResponse> {
     Json(status_snapshot(&state).await)
 }
@@ -284,6 +305,9 @@ async fn api_update_config(
 async fn run_web_ui(state: WebState) -> Result<()> {
     let router = Router::new()
         .route("/", get(web_index))
+        .route("/assets/styles.css", get(web_styles))
+        .route("/assets/app.js", get(web_script))
+        .route("/favicon.ico", get(web_favicon))
         .route("/api/status", get(api_status))
         .route("/api/config", post(api_update_config))
         .with_state(state);
@@ -297,518 +321,9 @@ async fn run_web_ui(state: WebState) -> Result<()> {
         .context("Web UI server failed")
 }
 
-const WEB_UI_HTML: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Roon Beacon</title>
-  <style>
-    :root {
-      color-scheme: dark;
-      --bg: #111318;
-      --panel: #191d24;
-      --panel-2: #202631;
-      --line: #343b49;
-      --text: #f3f5f8;
-      --muted: #aeb6c2;
-      --soft: #747f91;
-      --accent: #f0c86a;
-      --accent-2: #62d4ff;
-      --ok: #7ee3a1;
-      --danger: #ff8f86;
-      --radius: 8px;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100dvh;
-      background:
-        radial-gradient(circle at 18% 14%, rgba(98, 212, 255, 0.12), transparent 28%),
-        linear-gradient(135deg, #101217 0%, #171b22 48%, #0f1116 100%);
-      color: var(--text);
-    }
-    button, input {
-      font: inherit;
-    }
-    .shell {
-      width: min(1120px, calc(100% - 32px));
-      margin: 0 auto;
-      padding: 24px 0 32px;
-    }
-    header {
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 16px;
-      align-items: center;
-      min-height: 80px;
-      border-bottom: 1px solid var(--line);
-    }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      min-width: 0;
-    }
-    .mark {
-      width: 46px;
-      height: 46px;
-      border: 1px solid rgba(240, 200, 106, 0.5);
-      border-radius: 50%;
-      display: grid;
-      place-items: center;
-      background: #151920;
-      box-shadow: inset 0 0 0 6px rgba(240, 200, 106, 0.08);
-    }
-    .mark svg {
-      width: 26px;
-      height: 26px;
-      stroke: var(--accent);
-    }
-    h1 {
-      margin: 0;
-      font-size: clamp(28px, 4vw, 46px);
-      line-height: 1;
-      letter-spacing: 0;
-    }
-    .subtitle {
-      margin: 6px 0 0;
-      color: var(--muted);
-      font-size: 15px;
-    }
-    .lang {
-      display: inline-grid;
-      grid-template-columns: 1fr 1fr;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      overflow: hidden;
-      background: rgba(255, 255, 255, 0.03);
-    }
-    .lang button {
-      min-width: 72px;
-      min-height: 44px;
-      border: 0;
-      color: var(--muted);
-      background: transparent;
-      cursor: pointer;
-    }
-    .lang button.active {
-      color: #111318;
-      background: var(--accent);
-    }
-    main {
-      display: grid;
-      grid-template-columns: 1.1fr 0.9fr;
-      gap: 18px;
-      margin-top: 22px;
-    }
-    .panel {
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: rgba(25, 29, 36, 0.92);
-    }
-    .panel-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 18px 18px 0;
-      align-items: center;
-    }
-    h2 {
-      margin: 0;
-      font-size: 18px;
-      line-height: 1.2;
-      letter-spacing: 0;
-    }
-    .status-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      min-height: 32px;
-      padding: 0 10px;
-      border: 1px solid rgba(126, 227, 161, 0.35);
-      border-radius: 999px;
-      color: var(--ok);
-      background: rgba(126, 227, 161, 0.08);
-      font-size: 13px;
-    }
-    .dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: currentColor;
-    }
-    .route {
-      padding: 18px;
-    }
-    .route-line {
-      display: grid;
-      grid-template-columns: 1fr 44px 1fr;
-      gap: 10px;
-      align-items: center;
-    }
-    .endpoint {
-      min-height: 112px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: var(--panel-2);
-      padding: 14px;
-    }
-    .label {
-      color: var(--soft);
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: .08em;
-    }
-    .value {
-      margin-top: 10px;
-      font-size: clamp(18px, 2vw, 26px);
-      line-height: 1.15;
-      overflow-wrap: anywhere;
-      font-variant-numeric: tabular-nums;
-    }
-    .transport {
-      color: var(--accent-2);
-      display: grid;
-      place-items: center;
-    }
-    .transport svg {
-      width: 28px;
-      height: 28px;
-      stroke: currentColor;
-    }
-    .metrics {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 10px;
-      margin-top: 14px;
-    }
-    .metric {
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      padding: 12px;
-      background: rgba(255, 255, 255, 0.03);
-      min-height: 86px;
-    }
-    .metric .num {
-      margin-top: 8px;
-      font-size: 24px;
-      font-weight: 650;
-      font-variant-numeric: tabular-nums;
-    }
-    form {
-      display: grid;
-      gap: 14px;
-      padding: 18px;
-    }
-    .field {
-      display: grid;
-      gap: 7px;
-    }
-    .field span {
-      color: var(--muted);
-      font-size: 14px;
-    }
-    input {
-      width: 100%;
-      min-height: 44px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      color: var(--text);
-      background: #11151c;
-      padding: 0 12px;
-      outline: none;
-    }
-    input:focus {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 3px rgba(240, 200, 106, 0.18);
-    }
-    .switch {
-      min-height: 44px;
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: center;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      padding: 0 12px;
-      background: #11151c;
-    }
-    .switch input {
-      width: 22px;
-      height: 22px;
-      min-height: 22px;
-      accent-color: var(--accent);
-    }
-    .actions {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      margin-top: 2px;
-    }
-    .primary {
-      min-height: 44px;
-      border: 0;
-      border-radius: var(--radius);
-      color: #111318;
-      background: var(--accent);
-      padding: 0 16px;
-      font-weight: 650;
-      cursor: pointer;
-      display: inline-flex;
-      gap: 8px;
-      align-items: center;
-    }
-    .primary svg {
-      width: 18px;
-      height: 18px;
-      stroke: currentColor;
-    }
-    .feedback {
-      min-height: 22px;
-      color: var(--muted);
-      font-size: 14px;
-    }
-    footer {
-      margin-top: 18px;
-      color: var(--soft);
-      font-size: 13px;
-    }
-    @media (max-width: 820px) {
-      header,
-      main {
-        grid-template-columns: 1fr;
-      }
-      .lang {
-        width: 100%;
-      }
-      .metrics {
-        grid-template-columns: repeat(2, 1fr);
-      }
-      .route-line {
-        grid-template-columns: 1fr;
-      }
-      .transport {
-        min-height: 34px;
-        transform: rotate(90deg);
-      }
-    }
-  </style>
-</head>
-<body>
-  <div class="shell">
-    <header>
-      <div class="brand">
-        <div class="mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="8"></circle>
-            <path d="M8 12h8M12 8v8"></path>
-          </svg>
-        </div>
-        <div>
-          <h1>Roon Beacon</h1>
-          <p class="subtitle" data-i18n="subtitle">Local discovery bridge for a remote Roon Core</p>
-        </div>
-      </div>
-      <div class="lang" role="group" aria-label="Language">
-        <button type="button" data-lang="en">EN</button>
-        <button type="button" data-lang="zh">中文</button>
-      </div>
-    </header>
-
-    <main>
-      <section class="panel">
-        <div class="panel-head">
-          <h2 data-i18n="signal">Signal Path</h2>
-          <div class="status-pill"><span class="dot"></span><span data-i18n="running">Running</span></div>
-        </div>
-        <div class="route">
-          <div class="route-line">
-            <div class="endpoint">
-              <div class="label" data-i18n="local">Local LAN</div>
-              <div class="value" id="localIp">-</div>
-              <div class="label" id="localPorts">SOOD 9003 · TCP 9330</div>
-            </div>
-            <div class="transport" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M5 12h14"></path>
-                <path d="m13 6 6 6-6 6"></path>
-              </svg>
-            </div>
-            <div class="endpoint">
-              <div class="label" data-i18n="remote">Remote Core</div>
-              <div class="value" id="remoteIp">-</div>
-              <div class="label" id="mode">-</div>
-            </div>
-          </div>
-          <div class="metrics">
-            <div class="metric"><div class="label" data-i18n="queries">SOOD Queries</div><div class="num" id="q">0</div></div>
-            <div class="metric"><div class="label" data-i18n="live">Live Core</div><div class="num" id="live">0</div></div>
-            <div class="metric"><div class="label" data-i18n="fallback">Fallbacks</div><div class="num" id="fallback">0</div></div>
-            <div class="metric"><div class="label" data-i18n="tcp">TCP Sessions</div><div class="num" id="tcp">0</div></div>
-          </div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head">
-          <h2 data-i18n="runtime">Runtime</h2>
-        </div>
-        <form id="configForm">
-          <label class="field">
-            <span data-i18n="name">Fallback display name</span>
-            <input id="name" name="name" autocomplete="off">
-          </label>
-          <label class="field">
-            <span data-i18n="interval">Announcement interval, seconds</span>
-            <input id="broadcastInterval" name="broadcastInterval" type="number" min="0" max="3600">
-          </label>
-          <label class="field">
-            <span data-i18n="timeout">Live SOOD timeout, ms</span>
-            <input id="liveTimeout" name="liveTimeout" type="number" min="100" max="10000">
-          </label>
-          <label class="switch">
-            <span data-i18n="reverse">Reverse SOOD proxy</span>
-            <input id="reverseProxy" name="reverseProxy" type="checkbox">
-          </label>
-          <label class="field">
-            <span data-i18n="proxyIp">Reachable proxy IP</span>
-            <input id="proxyIp" name="proxyIp" autocomplete="off">
-          </label>
-          <div class="actions">
-            <button class="primary" type="submit">
-              <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M20 6 9 17l-5-5"></path>
-              </svg>
-              <span data-i18n="save">Save</span>
-            </button>
-            <span class="feedback" id="feedback"></span>
-          </div>
-        </form>
-      </section>
-    </main>
-
-    <footer><span data-i18n="uptime">Uptime</span>: <span id="uptime">0s</span></footer>
-  </div>
-
-  <script>
-    const copy = {
-      en: {
-        subtitle: 'Local discovery bridge for a remote Roon Core',
-        signal: 'Signal Path',
-        running: 'Running',
-        local: 'Local LAN',
-        remote: 'Remote Core',
-        queries: 'SOOD Queries',
-        live: 'Live Core',
-        fallback: 'Fallbacks',
-        tcp: 'TCP Sessions',
-        runtime: 'Runtime',
-        name: 'Fallback display name',
-        interval: 'Announcement interval, seconds',
-        timeout: 'Live SOOD timeout, ms',
-        reverse: 'Reverse SOOD proxy',
-        proxyIp: 'Reachable proxy IP',
-        save: 'Save',
-        saved: 'Saved',
-        failed: 'Save failed',
-        uptime: 'Uptime',
-        broadcast: 'broadcast',
-        multicast: 'multicast'
-      },
-      zh: {
-        subtitle: '远端 Roon Core 的本地发现桥接',
-        signal: '信号路径',
-        running: '运行中',
-        local: '本地局域网',
-        remote: '远端 Core',
-        queries: 'SOOD 查询',
-        live: 'Core 真包',
-        fallback: '模板兜底',
-        tcp: 'TCP 会话',
-        runtime: '运行设置',
-        name: '兜底显示名',
-        interval: '主动广播间隔，秒',
-        timeout: '实时 SOOD 超时，毫秒',
-        reverse: '反向 SOOD 代理',
-        proxyIp: 'Core 可达的代理 IP',
-        save: '保存',
-        saved: '已保存',
-        failed: '保存失败',
-        uptime: '运行时间',
-        broadcast: '广播',
-        multicast: '多播'
-      }
-    };
-    let lang = localStorage.getItem('roonBeaconLang') || (navigator.language.startsWith('zh') ? 'zh' : 'en');
-    const $ = (id) => document.getElementById(id);
-    function t(key) { return copy[lang][key] || copy.en[key] || key; }
-    function applyLang() {
-      document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
-      document.querySelectorAll('[data-i18n]').forEach((el) => { el.textContent = t(el.dataset.i18n); });
-      document.querySelectorAll('[data-lang]').forEach((btn) => btn.classList.toggle('active', btn.dataset.lang === lang));
-    }
-    function seconds(value) {
-      const h = Math.floor(value / 3600);
-      const m = Math.floor((value % 3600) / 60);
-      const s = value % 60;
-      if (h) return `${h}h ${m}m`;
-      if (m) return `${m}m ${s}s`;
-      return `${s}s`;
-    }
-    async function loadStatus(updateForm = false) {
-      const res = await fetch('/api/status');
-      const data = await res.json();
-      $('localIp').textContent = data.local_ip;
-      $('remoteIp').textContent = data.remote_ip;
-      $('localPorts').textContent = `SOOD ${data.sood_port} · TCP ${data.discovery_port}`;
-      $('mode').textContent = data.use_broadcast ? t('broadcast') : t('multicast');
-      $('q').textContent = data.metrics.sood_queries;
-      $('live').textContent = data.metrics.live_core_responses;
-      $('fallback').textContent = data.metrics.template_fallbacks;
-      $('tcp').textContent = data.metrics.tcp_connections;
-      $('uptime').textContent = seconds(data.uptime_secs);
-      if (updateForm) {
-        $('name').value = data.config.name;
-        $('broadcastInterval').value = data.config.broadcast_interval_secs;
-        $('liveTimeout').value = data.config.live_proxy_timeout_ms;
-        $('reverseProxy').checked = data.config.reverse_proxy;
-        $('proxyIp').value = data.config.proxy_ip || '';
-      }
-    }
-    document.querySelectorAll('[data-lang]').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        lang = btn.dataset.lang;
-        localStorage.setItem('roonBeaconLang', lang);
-        applyLang();
-        loadStatus(false).catch(() => {});
-      });
-    });
-    $('configForm').addEventListener('submit', async (event) => {
-      event.preventDefault();
-      $('feedback').textContent = '';
-      const body = {
-        name: $('name').value,
-        broadcast_interval_secs: Number($('broadcastInterval').value),
-        live_proxy_timeout_ms: Number($('liveTimeout').value),
-        reverse_proxy: $('reverseProxy').checked,
-        proxy_ip: $('proxyIp').value || null
-      };
-      const res = await fetch('/api/config', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      $('feedback').textContent = res.ok ? t('saved') : t('failed');
-      await loadStatus(true);
-    });
-    applyLang();
-    loadStatus(true).catch(() => {});
-    setInterval(() => loadStatus(false).catch(() => {}), 2000);
-  </script>
-</body>
-</html>"#;
+const WEB_UI_HTML: &str = include_str!("web/index.html");
+const WEB_UI_CSS: &str = include_str!("web/styles.css");
+const WEB_UI_JS: &str = include_str!("web/app.js");
 
 fn hex_dump(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 4);
@@ -1656,6 +1171,14 @@ mod tests {
             normalized_optional_string(Some("  100.64.0.10  ".to_string())),
             Some("100.64.0.10".to_string())
         );
+    }
+
+    #[test]
+    fn embedded_web_ui_uses_split_assets() {
+        assert!(WEB_UI_HTML.contains(r#"href="/assets/styles.css""#));
+        assert!(WEB_UI_HTML.contains(r#"src="/assets/app.js""#));
+        assert!(WEB_UI_CSS.contains(".shell"));
+        assert!(WEB_UI_JS.contains("loadStatus"));
     }
 
     #[test]
