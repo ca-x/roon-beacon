@@ -1,0 +1,17 @@
+[package]
+name = "roon-sood"
+version = "0.5.3"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "SOOD UDP discovery protocol for Roon audio system"
+
+[dependencies]
+bytes = "1"
+socket2 = { version = "0.5", features = ["all"] }
+thiserror = "1"
+tokio = { version = "1", features = ["net", "sync", "time", "rt", "macros"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+proptest = "1"
