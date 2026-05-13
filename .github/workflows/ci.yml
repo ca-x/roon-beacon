@@ -1,0 +1,151 @@
+name: CI and Release
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: roon-beacon
+
+jobs:
+  quality:
+    name: Quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: quality
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            exe: roon-beacon
+            archive: roon-beacon-linux-x86_64.tar.gz
+
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            exe: roon-beacon
+            archive: roon-beacon-macos-x86_64.tar.gz
+
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            exe: roon-beacon
+            archive: roon-beacon-macos-aarch64.tar.gz
+
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: roon-beacon.exe
+            archive: roon-beacon-windows-x86_64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} --bin roon-beacon
+
+      - name: Package binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist package
+          cp "target/${TARGET}/release/${EXE}" package/
+          cp README.md README.zh-CN.md LICENSE package/
+
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            (cd package && 7z a -tzip "../dist/${ARCHIVE}" ./*)
+          else
+            chmod +x "package/${EXE}"
+            tar -C package -czf "dist/${ARCHIVE}" .
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh release-artifacts/
+
+      - name: Create or update release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release create "${{ github.ref_name }}" \
+              --title "${{ github.ref_name }}" \
+              --generate-notes
+          fi
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          find release-artifacts -type f -print0 | while IFS= read -r -d '' file; do
+            gh release upload "${{ github.ref_name }}" "$file" --clobber
+          done

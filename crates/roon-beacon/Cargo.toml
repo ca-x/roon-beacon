@@ -2,7 +2,7 @@
 name = "roon-beacon"
 version = "0.1.0"
 edition = "2021"
-description = "Roon Core 远端桥接工具 —— 把远端 Roon Core 信标广播到本地局域网"
+description = "Local discovery bridge for a remote Roon Core"
 
 [[bin]]
 name = "roon-beacon"
@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["form", "json"] }
 clap = { version = "=4.4.18", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -17,4 +18,4 @@ anyhow = "1"
 socket2 = "0.5"
 roon-sood = { path = "../roon-sood" }
 uuid = { version = "1", features = ["v4"] }
-
+serde = { version = "1", features = ["derive"] }

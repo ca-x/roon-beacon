@@ -1,51 +1,51 @@
 //! roon-beacon
 //!
-//! 在本地局域网运行，把远端 NAS 上的 Roon Core 桥接过来。
-//!
-//! 核心问题：Roon 用私有 SOOD 协议发现 Core，必须在正确的局域网网卡上
-//! 监听和响应，Tailscale 虚拟网卡不参与 SOOD。
-//!
-//! 架构：
-//!   本地 Roon Remote
-//!     │ SOOD UDP 239.255.90.90:9003
-//!     ▼
-//!   roon-beacon（绑定局域网网卡 192.168.1.x）
-//!     │  SOOD 响应：告诉 Remote "Core 在 192.168.1.x:9100"
-//!     │  TCP 监听：192.168.1.x:9100 等端口
-//!     │
-//!     │ Tailscale 隧道（100.x.x.x）
-//!     ▼
-//!   NAS Roon Core（10.10.68.x 或任意网段）
+//! Runs inside the local LAN and presents a remote Roon Core as a local SOOD
+//! beacon plus TCP forwarding endpoint.
 
 use anyhow::{Context, Result};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::Html,
+    routing::{get, post},
+    Json, Router,
+};
 use clap::{Parser, ValueEnum};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use std::time::Instant;
+use tokio::io::{self, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::RwLock;
+use tokio::time::{sleep, Duration};
+use tracing::{debug, error, info, warn};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum AddrFamily {
-    /// 优先 IPv4
+    /// Prefer IPv4 addresses.
     V4,
-    /// 优先 IPv6
+    /// Prefer IPv6 addresses.
     V6,
-    /// 使用第一个解析到的地址
+    /// Use the first resolved address.
     Any,
 }
-use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
-use tokio::io::{self, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::time::{interval, sleep, Duration};
-use tracing::{debug, error, info, warn};
 
 use roon_sood::{
     self, serialize_query, serialize_response, SoodMessage, SoodType, ROON_CORE_SERVICE_ID,
     SOOD_PORT,
 };
 
-// ── 常量 ──────────────────────────────────────────────────────────────────────
-
 const SOOD_MCAST: Ipv4Addr = Ipv4Addr::new(239, 255, 90, 90);
 const ROON_DISCOVERY_PORT: u16 = 9330;
+const SOOD_ANNOUNCE_TTL: u32 = 64;
+const WEB_UI_ADDR: &str = "127.0.0.1:9339";
+const DEFAULT_LIVE_PROXY_TIMEOUT_MS: u64 = 800;
 
 const ROON_PORTS: &[(u16, &str)] = &[
     (9100, "RAAT / legacy"),
@@ -53,81 +53,762 @@ const ROON_PORTS: &[(u16, &str)] = &[
     (9150, "Roon Core TCP"),
     (9200, "Roon Web Display"),
     (9330, "Roon Core API / Web Display"),
-    (9331, "Roon Core API 备用"),
+    (9331, "Roon Core API fallback"),
     (9332, "Roon Web Display HTTPS"),
     (55000, "Roon Core HTTPS"),
 ];
 
-// ── CLI ───────────────────────────────────────────────────────────────────────
-
-/// Roon Beacon —— 将远端 NAS 的 Roon Core 以 SOOD 信标的形式广播到本地局域网
+/// Roon Beacon publishes a remote Roon Core into the local LAN.
 ///
-/// 关键：--local-ip 必须填本机【局域网】IP（客户端所在网段，如 192.168.1.10），
-///       不要填 VPN / overlay 网络的 IP，也不能填 127.0.0.1
+/// `--local-ip` must be the LAN address visible to Roon Remote clients, not a
+/// VPN/overlay address and not 127.0.0.1.
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
-    /// 远端 NAS 的地址，支持三种写法：
-    ///   • IP 地址（推荐）: 例如 100.107.146.8
-    ///   • 主机名: 例如 lazycat
-    ///   • 完整域名: 例如 nas.example.com
+    /// Remote Roon Core host. IP addresses, host names, and DNS names are supported.
     #[arg(short = 'r', long, value_name = "HOST")]
     remote_ip: String,
 
-    /// 【必填】本机局域网 IP（与 Roon Remote 所在的网段一致）
-    /// 用 `ip addr` 或 `ifconfig` 查看，选客户端所在的网段那个
-    /// 不要填 VPN / overlay 网络的 IP（例如 100.x.x.x）
+    /// Local LAN IP in the same network as Roon Remote clients.
     #[arg(short = 'l', long, value_name = "IP")]
     local_ip: String,
 
-    /// Roon Remote 里显示的 Core 名称
+    /// Fallback Core name shown in Roon Remote when live SOOD proxying is unavailable.
     #[arg(short = 'n', long, default_value = "Roon Core (Beacon)")]
     name: String,
 
-    /// 主动广播 SOOD 心跳间隔（秒），0 = 禁用
+    /// Active SOOD announcement interval in seconds; 0 disables announcements.
     #[arg(long, default_value_t = 10)]
     broadcast_interval: u64,
 
-    /// 使用 UDP 广播（255.255.255.255）代替多播，适配不支持 IGMP 的路由器
+    /// Use UDP broadcast (255.255.255.255) instead of multicast.
     #[arg(long)]
     use_broadcast: bool,
 
-    /// 连接远端失败后的重试间隔（秒）
+    /// Retry delay after failed TCP upstream connections, in seconds.
     #[arg(long, default_value_t = 3)]
     retry_secs: u64,
 
-    /// 域名解析时的地址族偏好（当 --remote-ip 是域名/主机名时生效）
-    ///   v4 = 优先 IPv4（推荐）
-    ///   v6 = 优先 IPv6
-    ///   any = 使用第一个解析到的地址
+    /// Address family preference for host name resolution.
     #[arg(long, value_enum, default_value_t = AddrFamily::V4)]
     prefer: AddrFamily,
 
-    /// 跳过某些端口（本机已被其他程序占用，比如本地 Roon Bridge/RAATServer 占用 9200）
-    /// 用逗号分隔：--skip-ports 9200,9100
+    /// Skip local TCP forwarding ports, comma separated.
     #[arg(long, value_name = "PORTS", value_delimiter = ',')]
     skip_ports: Vec<u16>,
 
-    /// 反向 SOOD 代理：把本地 RAAT Bridge / Output 的多播广告转发给远端 Core
-    /// 让 Core 在音频设备列表看到本地设备（广告里的 IP 改写为 --proxy-ip 指定的地址）
+    /// Forward local RAAT Bridge/Output SOOD announcements to the remote Core.
     #[arg(long)]
     reverse_proxy: bool,
 
-    /// 反向代理时改写广告用的【桥接对外可达 IP】（Core 会来这个 IP 建立 RAAT 连接）
-    /// 通常是桥接在 overlay 网络里的 IP（例如 VPN / Tailscale 分配的地址）
+    /// Reachable address used when rewriting reverse-proxied local RAAT announcements.
     #[arg(long, value_name = "IP", alias = "tailscale-ip")]
     proxy_ip: Option<String>,
 
-    /// 禁用从远端 Core 探测真实 SOOD 字段（遇到问题时用）
+    /// Disable startup probing of the remote Core SOOD template.
     #[arg(long)]
     no_probe: bool,
 
-    /// 探测远端 Core 的超时时间（秒）
+    /// Startup probe timeout in seconds.
     #[arg(long, default_value_t = 3)]
     probe_timeout: u64,
 }
 
-// ── 工具函数 ─────────────────────────────────────────────────────────────────
+#[derive(Clone, Debug, Serialize)]
+struct RuntimeConfig {
+    name: String,
+    broadcast_interval_secs: u64,
+    live_proxy_timeout_ms: u64,
+    reverse_proxy: bool,
+    proxy_ip: Option<String>,
+}
+
+impl RuntimeConfig {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            name: args.name.clone(),
+            broadcast_interval_secs: args.broadcast_interval,
+            live_proxy_timeout_ms: DEFAULT_LIVE_PROXY_TIMEOUT_MS,
+            reverse_proxy: args.reverse_proxy,
+            proxy_ip: normalized_optional_string(args.proxy_ip.clone()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RuntimeMetrics {
+    sood_queries: AtomicU64,
+    sood_responses: AtomicU64,
+    live_core_responses: AtomicU64,
+    template_fallbacks: AtomicU64,
+    reverse_announcements: AtomicU64,
+    tcp_connections: AtomicU64,
+    tcp_down_bytes: AtomicU64,
+    tcp_up_bytes: AtomicU64,
+}
+
+#[derive(Serialize)]
+struct MetricsSnapshot {
+    sood_queries: u64,
+    sood_responses: u64,
+    live_core_responses: u64,
+    template_fallbacks: u64,
+    reverse_announcements: u64,
+    tcp_connections: u64,
+    tcp_down_bytes: u64,
+    tcp_up_bytes: u64,
+}
+
+impl RuntimeMetrics {
+    fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            sood_queries: self.sood_queries.load(Ordering::Relaxed),
+            sood_responses: self.sood_responses.load(Ordering::Relaxed),
+            live_core_responses: self.live_core_responses.load(Ordering::Relaxed),
+            template_fallbacks: self.template_fallbacks.load(Ordering::Relaxed),
+            reverse_announcements: self.reverse_announcements.load(Ordering::Relaxed),
+            tcp_connections: self.tcp_connections.load(Ordering::Relaxed),
+            tcp_down_bytes: self.tcp_down_bytes.load(Ordering::Relaxed),
+            tcp_up_bytes: self.tcp_up_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WebState {
+    config: Arc<RwLock<RuntimeConfig>>,
+    metrics: Arc<RuntimeMetrics>,
+    started_at: Instant,
+    remote_ip: String,
+    local_ip: String,
+    use_broadcast: bool,
+}
+
+#[derive(Deserialize)]
+struct UpdateConfig {
+    name: String,
+    broadcast_interval_secs: u64,
+    live_proxy_timeout_ms: u64,
+    reverse_proxy: bool,
+    proxy_ip: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StatusResponse {
+    version: &'static str,
+    remote_ip: String,
+    local_ip: String,
+    sood_port: u16,
+    discovery_port: u16,
+    web_ui_addr: &'static str,
+    use_broadcast: bool,
+    uptime_secs: u64,
+    config: RuntimeConfig,
+    metrics: MetricsSnapshot,
+}
+
+fn normalized_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+async fn status_snapshot(state: &WebState) -> StatusResponse {
+    StatusResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        remote_ip: state.remote_ip.clone(),
+        local_ip: state.local_ip.clone(),
+        sood_port: SOOD_PORT,
+        discovery_port: ROON_DISCOVERY_PORT,
+        web_ui_addr: WEB_UI_ADDR,
+        use_broadcast: state.use_broadcast,
+        uptime_secs: state.started_at.elapsed().as_secs(),
+        config: state.config.read().await.clone(),
+        metrics: state.metrics.snapshot(),
+    }
+}
+
+async fn web_index() -> Html<&'static str> {
+    Html(WEB_UI_HTML)
+}
+
+async fn api_status(State(state): State<WebState>) -> Json<StatusResponse> {
+    Json(status_snapshot(&state).await)
+}
+
+async fn api_update_config(
+    State(state): State<WebState>,
+    Json(input): Json<UpdateConfig>,
+) -> Result<Json<StatusResponse>, (StatusCode, String)> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name must not be empty".to_string(),
+        ));
+    }
+
+    if input.broadcast_interval_secs > 3600 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "broadcast interval must be between 0 and 3600 seconds".to_string(),
+        ));
+    }
+
+    if !(100..=10_000).contains(&input.live_proxy_timeout_ms) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "live proxy timeout must be between 100 and 10000 ms".to_string(),
+        ));
+    }
+
+    let next = RuntimeConfig {
+        name: name.to_string(),
+        broadcast_interval_secs: input.broadcast_interval_secs,
+        live_proxy_timeout_ms: input.live_proxy_timeout_ms,
+        reverse_proxy: input.reverse_proxy,
+        proxy_ip: normalized_optional_string(input.proxy_ip),
+    };
+
+    *state.config.write().await = next;
+    info!("Runtime config updated from Web UI");
+
+    Ok(Json(status_snapshot(&state).await))
+}
+
+async fn run_web_ui(state: WebState) -> Result<()> {
+    let router = Router::new()
+        .route("/", get(web_index))
+        .route("/api/status", get(api_status))
+        .route("/api/config", post(api_update_config))
+        .with_state(state);
+
+    let listener = TcpListener::bind(WEB_UI_ADDR)
+        .await
+        .with_context(|| format!("failed to bind Web UI at http://{WEB_UI_ADDR}"))?;
+    info!("Web UI listening at http://{WEB_UI_ADDR}");
+    axum::serve(listener, router)
+        .await
+        .context("Web UI server failed")
+}
+
+const WEB_UI_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Roon Beacon</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111318;
+      --panel: #191d24;
+      --panel-2: #202631;
+      --line: #343b49;
+      --text: #f3f5f8;
+      --muted: #aeb6c2;
+      --soft: #747f91;
+      --accent: #f0c86a;
+      --accent-2: #62d4ff;
+      --ok: #7ee3a1;
+      --danger: #ff8f86;
+      --radius: 8px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100dvh;
+      background:
+        radial-gradient(circle at 18% 14%, rgba(98, 212, 255, 0.12), transparent 28%),
+        linear-gradient(135deg, #101217 0%, #171b22 48%, #0f1116 100%);
+      color: var(--text);
+    }
+    button, input {
+      font: inherit;
+    }
+    .shell {
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 24px 0 32px;
+    }
+    header {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 16px;
+      align-items: center;
+      min-height: 80px;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
+    }
+    .mark {
+      width: 46px;
+      height: 46px;
+      border: 1px solid rgba(240, 200, 106, 0.5);
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: #151920;
+      box-shadow: inset 0 0 0 6px rgba(240, 200, 106, 0.08);
+    }
+    .mark svg {
+      width: 26px;
+      height: 26px;
+      stroke: var(--accent);
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(28px, 4vw, 46px);
+      line-height: 1;
+      letter-spacing: 0;
+    }
+    .subtitle {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 15px;
+    }
+    .lang {
+      display: inline-grid;
+      grid-template-columns: 1fr 1fr;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: rgba(255, 255, 255, 0.03);
+    }
+    .lang button {
+      min-width: 72px;
+      min-height: 44px;
+      border: 0;
+      color: var(--muted);
+      background: transparent;
+      cursor: pointer;
+    }
+    .lang button.active {
+      color: #111318;
+      background: var(--accent);
+    }
+    main {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 18px;
+      margin-top: 22px;
+    }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(25, 29, 36, 0.92);
+    }
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 18px 0;
+      align-items: center;
+    }
+    h2 {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 32px;
+      padding: 0 10px;
+      border: 1px solid rgba(126, 227, 161, 0.35);
+      border-radius: 999px;
+      color: var(--ok);
+      background: rgba(126, 227, 161, 0.08);
+      font-size: 13px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    .route {
+      padding: 18px;
+    }
+    .route-line {
+      display: grid;
+      grid-template-columns: 1fr 44px 1fr;
+      gap: 10px;
+      align-items: center;
+    }
+    .endpoint {
+      min-height: 112px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel-2);
+      padding: 14px;
+    }
+    .label {
+      color: var(--soft);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+    .value {
+      margin-top: 10px;
+      font-size: clamp(18px, 2vw, 26px);
+      line-height: 1.15;
+      overflow-wrap: anywhere;
+      font-variant-numeric: tabular-nums;
+    }
+    .transport {
+      color: var(--accent-2);
+      display: grid;
+      place-items: center;
+    }
+    .transport svg {
+      width: 28px;
+      height: 28px;
+      stroke: currentColor;
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 12px;
+      background: rgba(255, 255, 255, 0.03);
+      min-height: 86px;
+    }
+    .metric .num {
+      margin-top: 8px;
+      font-size: 24px;
+      font-weight: 650;
+      font-variant-numeric: tabular-nums;
+    }
+    form {
+      display: grid;
+      gap: 14px;
+      padding: 18px;
+    }
+    .field {
+      display: grid;
+      gap: 7px;
+    }
+    .field span {
+      color: var(--muted);
+      font-size: 14px;
+    }
+    input {
+      width: 100%;
+      min-height: 44px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      color: var(--text);
+      background: #11151c;
+      padding: 0 12px;
+      outline: none;
+    }
+    input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(240, 200, 106, 0.18);
+    }
+    .switch {
+      min-height: 44px;
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 0 12px;
+      background: #11151c;
+    }
+    .switch input {
+      width: 22px;
+      height: 22px;
+      min-height: 22px;
+      accent-color: var(--accent);
+    }
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 2px;
+    }
+    .primary {
+      min-height: 44px;
+      border: 0;
+      border-radius: var(--radius);
+      color: #111318;
+      background: var(--accent);
+      padding: 0 16px;
+      font-weight: 650;
+      cursor: pointer;
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .primary svg {
+      width: 18px;
+      height: 18px;
+      stroke: currentColor;
+    }
+    .feedback {
+      min-height: 22px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    footer {
+      margin-top: 18px;
+      color: var(--soft);
+      font-size: 13px;
+    }
+    @media (max-width: 820px) {
+      header,
+      main {
+        grid-template-columns: 1fr;
+      }
+      .lang {
+        width: 100%;
+      }
+      .metrics {
+        grid-template-columns: repeat(2, 1fr);
+      }
+      .route-line {
+        grid-template-columns: 1fr;
+      }
+      .transport {
+        min-height: 34px;
+        transform: rotate(90deg);
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div class="brand">
+        <div class="mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="8"></circle>
+            <path d="M8 12h8M12 8v8"></path>
+          </svg>
+        </div>
+        <div>
+          <h1>Roon Beacon</h1>
+          <p class="subtitle" data-i18n="subtitle">Local discovery bridge for a remote Roon Core</p>
+        </div>
+      </div>
+      <div class="lang" role="group" aria-label="Language">
+        <button type="button" data-lang="en">EN</button>
+        <button type="button" data-lang="zh">中文</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="panel">
+        <div class="panel-head">
+          <h2 data-i18n="signal">Signal Path</h2>
+          <div class="status-pill"><span class="dot"></span><span data-i18n="running">Running</span></div>
+        </div>
+        <div class="route">
+          <div class="route-line">
+            <div class="endpoint">
+              <div class="label" data-i18n="local">Local LAN</div>
+              <div class="value" id="localIp">-</div>
+              <div class="label" id="localPorts">SOOD 9003 · TCP 9330</div>
+            </div>
+            <div class="transport" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5 12h14"></path>
+                <path d="m13 6 6 6-6 6"></path>
+              </svg>
+            </div>
+            <div class="endpoint">
+              <div class="label" data-i18n="remote">Remote Core</div>
+              <div class="value" id="remoteIp">-</div>
+              <div class="label" id="mode">-</div>
+            </div>
+          </div>
+          <div class="metrics">
+            <div class="metric"><div class="label" data-i18n="queries">SOOD Queries</div><div class="num" id="q">0</div></div>
+            <div class="metric"><div class="label" data-i18n="live">Live Core</div><div class="num" id="live">0</div></div>
+            <div class="metric"><div class="label" data-i18n="fallback">Fallbacks</div><div class="num" id="fallback">0</div></div>
+            <div class="metric"><div class="label" data-i18n="tcp">TCP Sessions</div><div class="num" id="tcp">0</div></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2 data-i18n="runtime">Runtime</h2>
+        </div>
+        <form id="configForm">
+          <label class="field">
+            <span data-i18n="name">Fallback display name</span>
+            <input id="name" name="name" autocomplete="off">
+          </label>
+          <label class="field">
+            <span data-i18n="interval">Announcement interval, seconds</span>
+            <input id="broadcastInterval" name="broadcastInterval" type="number" min="0" max="3600">
+          </label>
+          <label class="field">
+            <span data-i18n="timeout">Live SOOD timeout, ms</span>
+            <input id="liveTimeout" name="liveTimeout" type="number" min="100" max="10000">
+          </label>
+          <label class="switch">
+            <span data-i18n="reverse">Reverse SOOD proxy</span>
+            <input id="reverseProxy" name="reverseProxy" type="checkbox">
+          </label>
+          <label class="field">
+            <span data-i18n="proxyIp">Reachable proxy IP</span>
+            <input id="proxyIp" name="proxyIp" autocomplete="off">
+          </label>
+          <div class="actions">
+            <button class="primary" type="submit">
+              <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M20 6 9 17l-5-5"></path>
+              </svg>
+              <span data-i18n="save">Save</span>
+            </button>
+            <span class="feedback" id="feedback"></span>
+          </div>
+        </form>
+      </section>
+    </main>
+
+    <footer><span data-i18n="uptime">Uptime</span>: <span id="uptime">0s</span></footer>
+  </div>
+
+  <script>
+    const copy = {
+      en: {
+        subtitle: 'Local discovery bridge for a remote Roon Core',
+        signal: 'Signal Path',
+        running: 'Running',
+        local: 'Local LAN',
+        remote: 'Remote Core',
+        queries: 'SOOD Queries',
+        live: 'Live Core',
+        fallback: 'Fallbacks',
+        tcp: 'TCP Sessions',
+        runtime: 'Runtime',
+        name: 'Fallback display name',
+        interval: 'Announcement interval, seconds',
+        timeout: 'Live SOOD timeout, ms',
+        reverse: 'Reverse SOOD proxy',
+        proxyIp: 'Reachable proxy IP',
+        save: 'Save',
+        saved: 'Saved',
+        failed: 'Save failed',
+        uptime: 'Uptime',
+        broadcast: 'broadcast',
+        multicast: 'multicast'
+      },
+      zh: {
+        subtitle: '远端 Roon Core 的本地发现桥接',
+        signal: '信号路径',
+        running: '运行中',
+        local: '本地局域网',
+        remote: '远端 Core',
+        queries: 'SOOD 查询',
+        live: 'Core 真包',
+        fallback: '模板兜底',
+        tcp: 'TCP 会话',
+        runtime: '运行设置',
+        name: '兜底显示名',
+        interval: '主动广播间隔，秒',
+        timeout: '实时 SOOD 超时，毫秒',
+        reverse: '反向 SOOD 代理',
+        proxyIp: 'Core 可达的代理 IP',
+        save: '保存',
+        saved: '已保存',
+        failed: '保存失败',
+        uptime: '运行时间',
+        broadcast: '广播',
+        multicast: '多播'
+      }
+    };
+    let lang = localStorage.getItem('roonBeaconLang') || (navigator.language.startsWith('zh') ? 'zh' : 'en');
+    const $ = (id) => document.getElementById(id);
+    function t(key) { return copy[lang][key] || copy.en[key] || key; }
+    function applyLang() {
+      document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+      document.querySelectorAll('[data-i18n]').forEach((el) => { el.textContent = t(el.dataset.i18n); });
+      document.querySelectorAll('[data-lang]').forEach((btn) => btn.classList.toggle('active', btn.dataset.lang === lang));
+    }
+    function seconds(value) {
+      const h = Math.floor(value / 3600);
+      const m = Math.floor((value % 3600) / 60);
+      const s = value % 60;
+      if (h) return `${h}h ${m}m`;
+      if (m) return `${m}m ${s}s`;
+      return `${s}s`;
+    }
+    async function loadStatus(updateForm = false) {
+      const res = await fetch('/api/status');
+      const data = await res.json();
+      $('localIp').textContent = data.local_ip;
+      $('remoteIp').textContent = data.remote_ip;
+      $('localPorts').textContent = `SOOD ${data.sood_port} · TCP ${data.discovery_port}`;
+      $('mode').textContent = data.use_broadcast ? t('broadcast') : t('multicast');
+      $('q').textContent = data.metrics.sood_queries;
+      $('live').textContent = data.metrics.live_core_responses;
+      $('fallback').textContent = data.metrics.template_fallbacks;
+      $('tcp').textContent = data.metrics.tcp_connections;
+      $('uptime').textContent = seconds(data.uptime_secs);
+      if (updateForm) {
+        $('name').value = data.config.name;
+        $('broadcastInterval').value = data.config.broadcast_interval_secs;
+        $('liveTimeout').value = data.config.live_proxy_timeout_ms;
+        $('reverseProxy').checked = data.config.reverse_proxy;
+        $('proxyIp').value = data.config.proxy_ip || '';
+      }
+    }
+    document.querySelectorAll('[data-lang]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        lang = btn.dataset.lang;
+        localStorage.setItem('roonBeaconLang', lang);
+        applyLang();
+        loadStatus(false).catch(() => {});
+      });
+    });
+    $('configForm').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      $('feedback').textContent = '';
+      const body = {
+        name: $('name').value,
+        broadcast_interval_secs: Number($('broadcastInterval').value),
+        live_proxy_timeout_ms: Number($('liveTimeout').value),
+        reverse_proxy: $('reverseProxy').checked,
+        proxy_ip: $('proxyIp').value || null
+      };
+      const res = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      $('feedback').textContent = res.ok ? t('saved') : t('failed');
+      await loadStatus(true);
+    });
+    applyLang();
+    loadStatus(true).catch(() => {});
+    setInterval(() => loadStatus(false).catch(() => {}), 2000);
+  </script>
+</body>
+</html>"#;
 
 fn hex_dump(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 4);
@@ -140,7 +821,7 @@ fn hex_dump(bytes: &[u8]) -> String {
         }
         s.push_str(&format!("{:02x}", b));
     }
-    // 附加 ASCII
+    // Append an ASCII gutter for debug logs.
     s.push_str("  |");
     for b in bytes {
         let c = if b.is_ascii_graphic() || *b == b' ' {
@@ -172,7 +853,7 @@ fn make_sood_response(tid: &str, name: &str, local_ip: &str) -> Result<Vec<u8>> 
     Ok(serialize_response(&props))
 }
 
-/// 通过 Tailscale 单播向远端 Roon Core 发送 SOOD 查询，获取真实响应模板
+/// Probe the remote Roon Core over unicast SOOD and capture a real response template.
 async fn probe_core_template(
     remote_ip: &str,
     timeout_secs: u64,
@@ -181,16 +862,13 @@ async fn probe_core_template(
 
     let sock = UdpSocket::bind("0.0.0.0:0")
         .await
-        .context("无法创建探测 socket")?;
+        .context("failed to create probe socket")?;
     sock.connect(fmt_addr(remote_ip, SOOD_PORT))
         .await
-        .with_context(|| format!("无法连接到 {}", fmt_addr(remote_ip, SOOD_PORT)))?;
+        .with_context(|| format!("failed to connect to {}", fmt_addr(remote_ip, SOOD_PORT)))?;
 
     let queries = [
-        (
-            "d52b2cb7-02c5-48fc-981b-a10f0aadd93b",
-            "ROON_SERVER",
-        ),
+        ("d52b2cb7-02c5-48fc-981b-a10f0aadd93b", "ROON_SERVER"),
         (ROON_CORE_SERVICE_ID, "ROON_API"),
     ];
 
@@ -201,8 +879,13 @@ async fn probe_core_template(
         props.insert("query_service_id".to_string(), Some(sid.to_string()));
         let pkt = serialize_query(&props);
 
-        info!("🔎 探测远端 Core ({label}) → {}", fmt_addr(remote_ip, SOOD_PORT));
-        sock.send(&pkt).await.context("发送探测包失败")?;
+        info!(
+            "Probing remote Core ({label}) at {}",
+            fmt_addr(remote_ip, SOOD_PORT)
+        );
+        sock.send(&pkt)
+            .await
+            .context("failed to send probe packet")?;
 
         let mut buf = vec![0u8; 4096];
         match timeout(Duration::from_secs(timeout_secs), sock.recv(&mut buf)).await {
@@ -210,9 +893,12 @@ async fn probe_core_template(
                 let dummy_src = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
                 match roon_sood::parse(&buf[..n], dummy_src) {
                     Ok(msg) if msg.msg_type == SoodType::Response => {
-                        info!("✅ 收到 Core 响应（{label}），字段数: {}", msg.props.len());
+                        info!(
+                            "Received Core response for {label}; {} fields",
+                            msg.props.len()
+                        );
                         for (k, v) in &msg.props {
-                            debug!("   Core 字段: {k} = {v:?}");
+                            debug!("   Core field: {k} = {v:?}");
                         }
                         let flat: HashMap<String, String> = msg
                             .props
@@ -221,52 +907,51 @@ async fn probe_core_template(
                             .collect();
                         return Ok(flat);
                     }
-                    Ok(_) => warn!("收到的包不是有效的 SOOD 响应"),
-                    Err(e) => warn!("解析 SOOD 响应失败: {e}"),
+                    Ok(_) => warn!("probe packet was not a SOOD response"),
+                    Err(e) => warn!("failed to parse SOOD probe response: {e}"),
                 }
             }
-            Ok(Err(e)) => warn!("探测 recv 错误: {e}"),
-            Err(_) => warn!("探测超时（{timeout_secs}s），尝试下一个 service_id"),
+            Ok(Err(e)) => warn!("probe receive error: {e}"),
+            Err(_) => warn!("probe timed out after {timeout_secs}s; trying next service_id"),
         }
     }
 
     anyhow::bail!(
-        "无法从 {remote_ip} 探测到 Roon Core 的 SOOD 响应\n\
-         → 检查：1) 网络是否可达  2) NAS 上 Roon Server 是否运行\n\
-         → 验证：在 NAS 上运行 `ss -ulnp | grep 9003`",
+        "failed to probe a Roon Core SOOD response from {remote_ip}\n\
+         Check that the network path is reachable and Roon Server is running.\n\
+         On the Core host, `ss -ulnp | grep 9003` should show a listener.",
         remote_ip = remote_ip
     )
 }
 
-/// 把手机发来的 SOOD 查询**原样**透传到 NAS Core 取真实响应
+/// Forward a client SOOD query unchanged to the remote Core and return the real response.
 async fn proxy_query_to_core(
     remote_ip: &str,
     phone_query_raw: &[u8],
-    _timeout_secs: u64,
+    timeout_ms: u64,
 ) -> Result<Vec<u8>> {
     use tokio::time::timeout;
 
     let sock = UdpSocket::bind("0.0.0.0:0")
         .await
-        .context("proxy socket bind 失败")?;
+        .context("failed to bind SOOD proxy socket")?;
     sock.connect(fmt_addr(remote_ip, SOOD_PORT))
         .await
-        .context("proxy connect 失败")?;
-    sock.send(phone_query_raw).await.context("proxy send 失败")?;
+        .context("failed to connect SOOD proxy socket")?;
+    sock.send(phone_query_raw)
+        .await
+        .context("failed to send proxied SOOD query")?;
 
     let mut buf = vec![0u8; 4096];
-    let n = timeout(
-        Duration::from_millis(800),
-        sock.recv(&mut buf),
-    )
-    .await
-    .context("proxy recv 超时（Core 未响应）")?
-    .context("proxy recv 失败")?;
+    let n = timeout(Duration::from_millis(timeout_ms), sock.recv(&mut buf))
+        .await
+        .context("SOOD proxy receive timed out")?
+        .context("failed to receive proxied SOOD response")?;
 
     Ok(buf[..n].to_vec())
 }
 
-/// 解析 --remote-ip 支持的三种输入
+/// Resolve the remote host supplied through `--remote-ip`.
 async fn resolve_remote_host(host: &str, prefer: AddrFamily) -> Result<String> {
     use tokio::net::lookup_host;
 
@@ -279,15 +964,13 @@ async fn resolve_remote_host(host: &str, prefer: AddrFamily) -> Result<String> {
         .await
         .with_context(|| {
             format!(
-                "无法解析主机名 '{host}'：\n\
-                 → 可以先用 `ping {host}` 或 `getent ahosts {host}` 测试\n\
-                 → 如果是内网域名，确认 DNS 配置"
+                "failed to resolve host '{host}'. Try `ping {host}` or `getent ahosts {host}` and check DNS configuration."
             )
         })?
         .collect();
 
     if addrs.is_empty() {
-        anyhow::bail!("'{host}' 解析后没有 IP 地址");
+        anyhow::bail!("'{host}' resolved to no addresses");
     }
 
     let chosen = match prefer {
@@ -295,7 +978,9 @@ async fn resolve_remote_host(host: &str, prefer: AddrFamily) -> Result<String> {
             if let Some(a) = addrs.iter().find(|a| a.is_ipv4()) {
                 Some(*a)
             } else {
-                tracing::warn!("⚠️  --prefer v4 但 '{host}' 没有 IPv4 记录，回退到 IPv6");
+                tracing::warn!(
+                    "--prefer v4 was requested, but '{host}' has no IPv4 record; falling back"
+                );
                 addrs.first().copied()
             }
         }
@@ -303,7 +988,9 @@ async fn resolve_remote_host(host: &str, prefer: AddrFamily) -> Result<String> {
             if let Some(a) = addrs.iter().find(|a| a.is_ipv6()) {
                 Some(*a)
             } else {
-                tracing::warn!("⚠️  --prefer v6 但 '{host}' 没有 IPv6 记录，回退到 IPv4");
+                tracing::warn!(
+                    "--prefer v6 was requested, but '{host}' has no IPv6 record; falling back"
+                );
                 addrs.first().copied()
             }
         }
@@ -312,10 +999,10 @@ async fn resolve_remote_host(host: &str, prefer: AddrFamily) -> Result<String> {
 
     chosen
         .map(|a| a.ip().to_string())
-        .ok_or_else(|| anyhow::anyhow!("'{host}' 解析后没有可用地址"))
+        .ok_or_else(|| anyhow::anyhow!("'{host}' resolved to no usable address"))
 }
 
-/// 把 IP + 端口拼成合法的 host:port 字符串（IPv6 加方括号）
+/// Build a legal host:port string, adding brackets for IPv6 addresses.
 fn fmt_addr(host: &str, port: u16) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]:{port}")
@@ -328,7 +1015,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// 反向 SOOD 代理：本机 RAAT Bridge / Output 在 239.255.90.90 发的广告 → 改写后单播给远端 Core
+/// Rewrite and forward local RAAT Bridge/Output SOOD announcements to the remote Core.
 async fn forward_local_announcement(
     raw: &[u8],
     msg: &SoodMessage,
@@ -336,13 +1023,13 @@ async fn forward_local_announcement(
     proxy_ip: &str,
     local_ip: &str,
 ) -> Result<()> {
-    // 不转发 Core 自己的广告（避免回环）
+    // Avoid forwarding Core announcements back to itself.
     if let Some(Some(sid)) = msg.props.get("service_id") {
         if sid == ROON_CORE_SERVICE_ID {
             return Ok(());
         }
     }
-    // 不转发桥接自己的响应
+    // Avoid forwarding responses generated by this bridge.
     if let Some(Some(uid)) = msg.props.get("unique_id") {
         if uid.starts_with("roon-beacon-") {
             return Ok(());
@@ -354,7 +1041,7 @@ async fn forward_local_announcement(
         }
     }
 
-    // 改写 IP 字段
+    // Rewrite any exact IP-valued TLV fields.
     let mut new_pkt = raw.to_vec();
     if let Some(pos) = find_subsequence(&new_pkt, local_ip.as_bytes()) {
         let mut rebuilt = Vec::with_capacity(new_pkt.len() + 16);
@@ -368,10 +1055,12 @@ async fn forward_local_announcement(
         }
     }
 
-    let sock = UdpSocket::bind("0.0.0.0:0").await.context("bind 失败")?;
+    let sock = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .context("failed to bind reverse proxy socket")?;
     sock.send_to(&new_pkt, fmt_addr(remote_ip, SOOD_PORT))
         .await
-        .context("反向代理 send 失败")?;
+        .context("failed to forward reverse SOOD announcement")?;
 
     let dn = msg
         .props
@@ -379,18 +1068,14 @@ async fn forward_local_announcement(
         .and_then(|v| v.as_deref())
         .or(msg.props.get("name").and_then(|v| v.as_deref()))
         .unwrap_or("?");
-    info!("🔁 反向广告 → Core ({remote_ip}): {dn}");
+    info!("Reverse announcement forwarded to Core ({remote_ip}): {dn}");
     Ok(())
 }
 
-/// 在 SOOD 包里把所有 IP 字段值替换为新 IP（处理长度不同的情况）
-fn rebuild_sood_pkt_with_ip_replaced(
-    pkt: &[u8],
-    old_ip: &str,
-    new_ip: &str,
-) -> Result<Vec<u8>> {
+/// Replace exact IP-valued SOOD fields, rebuilding TLV lengths when necessary.
+fn rebuild_sood_pkt_with_ip_replaced(pkt: &[u8], old_ip: &str, new_ip: &str) -> Result<Vec<u8>> {
     if pkt.len() < 7 || &pkt[..4] != b"SOOD" {
-        anyhow::bail!("不是 SOOD 包");
+        anyhow::bail!("not a SOOD packet");
     }
     let field_count = pkt[6] as usize;
     let mut i = 7;
@@ -445,7 +1130,7 @@ fn rebuild_sood_pkt_with_ip_replaced(
     Ok(out)
 }
 
-/// 用模板字段构造响应：保留 Core 的所有字段，只改写 IP/端口
+/// Build a fallback response from the probed Core template while rewriting host fields.
 fn make_sood_response_from_template(
     tid: &str,
     template: &HashMap<String, String>,
@@ -455,7 +1140,7 @@ fn make_sood_response_from_template(
     let http_port_str = ROON_DISCOVERY_PORT.to_string();
     let mut props: HashMap<String, Option<String>> = HashMap::new();
 
-    // _tid 总是用查询的 tid
+    // `_tid` must match the client query.
     props.insert("_tid".to_string(), Some(tid.to_string()));
 
     for (k, v) in template {
@@ -481,158 +1166,158 @@ fn should_answer_query(msg: &SoodMessage) -> bool {
         return false;
     }
 
-    match msg
-        .props
-        .get("query_service_id")
-        .and_then(|v| v.as_deref())
-    {
+    match msg.props.get("query_service_id").and_then(|v| v.as_deref()) {
         Some(service_id) => service_id == ROON_CORE_SERVICE_ID,
         None => true,
     }
 }
 
-/// 创建 SOOD UDP socket，绑定到指定局域网网卡
+/// Create the SOOD UDP socket on the selected LAN interface.
 async fn make_sood_socket(local_ip_v4: Ipv4Addr, use_broadcast: bool) -> Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
 
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-        .context("创建 UDP socket 失败")?;
+        .context("failed to create UDP socket")?;
 
     sock.set_reuse_address(true).ok();
+    sock.set_ttl(SOOD_ANNOUNCE_TTL).ok();
 
     if use_broadcast {
         sock.set_broadcast(true).ok();
     }
 
     sock.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, SOOD_PORT).into())
-        .with_context(|| format!("绑定 UDP 0.0.0.0:{SOOD_PORT} 失败（被占用？需要 sudo？）"))?;
+        .with_context(|| format!("failed to bind UDP 0.0.0.0:{SOOD_PORT}; port may be in use"))?;
 
     if !use_broadcast {
         sock.join_multicast_v4(&SOOD_MCAST, &local_ip_v4)
             .with_context(|| {
                 format!(
-                    "加入多播组 {SOOD_MCAST} 失败（接口 {local_ip_v4}）\n\
-                     → 请确认 --local-ip 是局域网 IP（如 192.168.1.x），不是 overlay 网络 IP"
+                    "failed to join multicast group {SOOD_MCAST} on interface {local_ip_v4}; confirm --local-ip is a LAN address"
                 )
             })?;
 
         sock.set_multicast_if_v4(&local_ip_v4)
-            .context("set_multicast_if_v4 失败")?;
+            .context("failed to set multicast interface")?;
 
+        sock.set_multicast_ttl_v4(SOOD_ANNOUNCE_TTL).ok();
         sock.set_multicast_loop_v4(true).ok();
     }
 
     let std_sock: std::net::UdpSocket = sock.into();
     std_sock.set_nonblocking(true)?;
-    UdpSocket::from_std(std_sock).context("转换 tokio UdpSocket 失败")
+    UdpSocket::from_std(std_sock).context("failed to convert UDP socket to tokio")
 }
 
-/// SOOD 服务：监听查询、响应、主动广播
+/// Run SOOD discovery responses and active announcements.
 async fn run_sood(
     local_ip_str: String,
-    name: String,
-    broadcast_interval_secs: u64,
     use_broadcast: bool,
     template: Option<Arc<HashMap<String, String>>>,
     remote_ip: String,
-    probe_timeout: u64,
-    reverse_proxy: bool,
-    proxy_ip: Option<String>,
+    config: Arc<RwLock<RuntimeConfig>>,
+    metrics: Arc<RuntimeMetrics>,
 ) -> Result<()> {
     let local_ip_v4: Ipv4Addr = local_ip_str
         .parse()
-        .context("--local-ip 必须是合法的 IPv4 地址")?;
+        .context("--local-ip must be a valid IPv4 address")?;
 
     let socket = Arc::new(
         make_sood_socket(local_ip_v4, use_broadcast)
             .await
-            .context("SOOD socket 初始化失败")?,
+            .context("failed to initialize SOOD socket")?,
     );
 
-    let mode = if use_broadcast { "广播" } else { "多播" };
-    info!("📡 SOOD 监听 0.0.0.0:{SOOD_PORT}，{mode} 网卡: {local_ip_str}");
-    info!("   Roon Remote 查询时将回复：Core 在 {local_ip_str}:{ROON_DISCOVERY_PORT}");
+    let mode = if use_broadcast {
+        "broadcast"
+    } else {
+        "multicast"
+    };
+    info!("SOOD listening on 0.0.0.0:{SOOD_PORT}; mode={mode}; interface={local_ip_str}");
+    info!("Roon Remote queries will resolve to {local_ip_str}:{ROON_DISCOVERY_PORT}");
 
-    // ── 主动广播任务 ──
-    if broadcast_interval_secs > 0 {
-        let sock2 = Arc::clone(&socket);
-        let lip = local_ip_str.clone();
-        let n = name.clone();
-        let use_broadcast = use_broadcast;
-        let tpl = template.clone();
-        tokio::spawn(async move {
-            sleep(Duration::from_millis(500)).await;
-            let mut ticker = interval(Duration::from_secs(broadcast_interval_secs));
-            loop {
-                ticker.tick().await;
-                let pkt_res = if let Some(ref t) = tpl {
-                    make_sood_response_from_template("*", t, &lip, &n)
-                } else {
-                    make_sood_response("*", &n, &lip)
-                };
-                let pkt = match pkt_res {
-                    Ok(pkt) => pkt,
-                    Err(e) => {
-                        warn!("SOOD 广播包构造失败: {e:#}");
-                        continue;
-                    }
-                };
-                let dest = if use_broadcast {
-                    SocketAddr::from((Ipv4Addr::new(255, 255, 255, 255), SOOD_PORT))
-                } else {
-                    SocketAddr::from((SOOD_MCAST, SOOD_PORT))
-                };
-                match sock2.send_to(&pkt, dest).await {
-                    Ok(_) => info!(
-                        "📡 SOOD {} → {}",
-                        if use_broadcast { "广播" } else { "多播" },
-                        dest
-                    ),
-                    Err(e) => warn!("SOOD 广播失败: {e}"),
-                }
+    let sock2 = Arc::clone(&socket);
+    let lip = local_ip_str.clone();
+    let tpl = template.clone();
+    let config_for_announcements = Arc::clone(&config);
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(500)).await;
+        loop {
+            let cfg = config_for_announcements.read().await.clone();
+            if cfg.broadcast_interval_secs == 0 {
+                sleep(Duration::from_secs(1)).await;
+                continue;
             }
-        });
-    }
 
-    // ── 监听并响应查询 ──
+            let pkt_res = if let Some(ref t) = tpl {
+                make_sood_response_from_template("*", t, &lip, &cfg.name)
+            } else {
+                make_sood_response("*", &cfg.name, &lip)
+            };
+            let pkt = match pkt_res {
+                Ok(pkt) => pkt,
+                Err(e) => {
+                    warn!("failed to build SOOD announcement packet: {e:#}");
+                    sleep(Duration::from_secs(cfg.broadcast_interval_secs)).await;
+                    continue;
+                }
+            };
+            let dest = if use_broadcast {
+                SocketAddr::from((Ipv4Addr::new(255, 255, 255, 255), SOOD_PORT))
+            } else {
+                SocketAddr::from((SOOD_MCAST, SOOD_PORT))
+            };
+            match sock2.send_to(&pkt, dest).await {
+                Ok(_) => info!("SOOD announcement sent to {dest} via {mode}"),
+                Err(e) => warn!("failed to send SOOD announcement: {e}"),
+            }
+
+            sleep(Duration::from_secs(cfg.broadcast_interval_secs)).await;
+        }
+    });
+
     let mut tid_cache: HashMap<String, (Vec<u8>, std::time::Instant)> = HashMap::new();
     let mut buf = vec![0u8; 4096];
     loop {
         let (len, src) = match socket.recv_from(&mut buf).await {
             Ok(x) => x,
             Err(e) => {
-                warn!("SOOD recv 错误: {e}");
+                warn!("SOOD receive error: {e}");
                 continue;
             }
         };
 
         let raw = &buf[..len];
-        debug!("SOOD 收到 from {src}: {len}B");
+        debug!("SOOD packet received from {src}: {len}B");
 
         let msg = match roon_sood::parse(raw, src) {
             Ok(msg) => msg,
             Err(e) => {
-                debug!("SOOD 解析失败: {e}");
+                debug!("failed to parse SOOD packet: {e}");
                 continue;
             }
         };
 
-        // ── 反向 SOOD 代理：本机 RAAT Bridge / Output 发的广告（Response）转给 Core ──
-        if reverse_proxy && msg.msg_type == SoodType::Response {
-            if let Some(ref pip) = proxy_ip {
+        let cfg = config.read().await.clone();
+        if cfg.reverse_proxy && msg.msg_type == SoodType::Response {
+            if let Some(ref pip) = cfg.proxy_ip {
                 if let Err(e) =
                     forward_local_announcement(raw, &msg, &remote_ip, pip, &local_ip_str).await
                 {
-                    debug!("反向代理失败: {e}");
+                    debug!("reverse SOOD proxy failed: {e}");
+                } else {
+                    metrics
+                        .reverse_announcements
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
             continue;
         }
 
-        // 只响应 Roon Core service 查询
         if !should_answer_query(&msg) {
             continue;
         }
+        metrics.sood_queries.fetch_add(1, Ordering::Relaxed);
 
         let tid = msg
             .props
@@ -645,37 +1330,41 @@ async fn run_sood(
             .get("query_service_id")
             .and_then(|v| v.as_deref())
             .unwrap_or("<none>");
-        info!("🔍 SOOD 查询 from {src} tid={tid} query_service_id={query_sid}");
+        info!("SOOD query from {src}: tid={tid} query_service_id={query_sid}");
         for (k, v) in &msg.props {
-            debug!("   查询字段: {k} = {v:?}");
+            debug!("   query field: {k} = {v:?}");
         }
 
-        // 缓存检查
         let now = std::time::Instant::now();
         tid_cache.retain(|_, (_, t)| now.duration_since(*t) < Duration::from_secs(60));
 
         let resp_bytes = if let Some((cached, _)) = tid_cache.get(tid) {
-            debug!("♻️  同 tid 复用缓存 ({}B)", cached.len());
+            debug!(
+                "reusing cached SOOD response for duplicate tid ({}B)",
+                cached.len()
+            );
             cached.clone()
         } else {
-            let live_resp = proxy_query_to_core(&remote_ip, raw, probe_timeout).await;
+            let live_resp = proxy_query_to_core(&remote_ip, raw, cfg.live_proxy_timeout_ms).await;
             let (bytes, is_real) = match live_resp {
                 Ok(real_pkt) => {
-                    info!("⚡ 使用 Core 实时真包响应 ({}B)", real_pkt.len());
-                    debug!("   Core 真包: {}", hex_dump(&real_pkt));
+                    info!("Using live Core SOOD response ({}B)", real_pkt.len());
+                    debug!("   live Core packet: {}", hex_dump(&real_pkt));
+                    metrics.live_core_responses.fetch_add(1, Ordering::Relaxed);
                     (real_pkt, true)
                 }
                 Err(e) => {
-                    debug!("Core 透传失败，退回模板: {e}");
+                    debug!("live SOOD proxy failed; falling back to template: {e}");
+                    metrics.template_fallbacks.fetch_add(1, Ordering::Relaxed);
                     let resp_res = if let Some(ref t) = template {
-                        make_sood_response_from_template(tid, t, &local_ip_str, &name)
+                        make_sood_response_from_template(tid, t, &local_ip_str, &cfg.name)
                     } else {
-                        make_sood_response(tid, &name, &local_ip_str)
+                        make_sood_response(tid, &cfg.name, &local_ip_str)
                     };
                     let r = match resp_res {
                         Ok(r) => r,
                         Err(e) => {
-                            warn!("SOOD 响应包构造失败: {e:#}");
+                            warn!("failed to build SOOD response packet: {e:#}");
                             continue;
                         }
                     };
@@ -689,15 +1378,14 @@ async fn run_sood(
         };
 
         if let Err(e) = socket.send_to(&resp_bytes, dest).await {
-            warn!("SOOD 单播响应失败 → {dest}: {e}");
+            warn!("failed to send SOOD unicast response to {dest}: {e}");
         } else {
-            info!("✅ SOOD 响应 → {dest}  ({}B)", resp_bytes.len());
-            debug!("   响应字节: {}", hex_dump(&resp_bytes));
+            metrics.sood_responses.fetch_add(1, Ordering::Relaxed);
+            info!("SOOD response sent to {dest} ({}B)", resp_bytes.len());
+            debug!("   response bytes: {}", hex_dump(&resp_bytes));
         }
     }
 }
-
-// ── TCP 转发 ──────────────────────────────────────────────────────────────────
 
 async fn pipe(mut r: io::ReadHalf<TcpStream>, mut w: io::WriteHalf<TcpStream>) -> u64 {
     let n = io::copy(&mut r, &mut w).await.unwrap_or(0);
@@ -705,9 +1393,19 @@ async fn pipe(mut r: io::ReadHalf<TcpStream>, mut w: io::WriteHalf<TcpStream>) -
     n
 }
 
-async fn handle_tcp(client: TcpStream, remote: Arc<String>, port: u16, retry_secs: u64) {
-    let peer = client.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+async fn handle_tcp(
+    client: TcpStream,
+    remote: Arc<String>,
+    port: u16,
+    retry_secs: u64,
+    metrics: Arc<RuntimeMetrics>,
+) {
+    let peer = client
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     info!("[TCP:{port}] ← {peer}");
+    metrics.tcp_connections.fetch_add(1, Ordering::Relaxed);
 
     let upstream = loop {
         match TcpStream::connect(fmt_addr(&remote, port)).await {
@@ -722,7 +1420,10 @@ async fn handle_tcp(client: TcpStream, remote: Arc<String>, port: u16, retry_sec
                 break s;
             }
             Err(e) => {
-                warn!("[TCP:{port}] 连不上远端 {}: {e}，{retry_secs}s 后重试", *remote);
+                warn!(
+                    "[TCP:{port}] failed to connect to upstream {}: {e}; retrying in {retry_secs}s",
+                    *remote
+                );
                 sleep(Duration::from_secs(retry_secs)).await;
             }
         }
@@ -736,12 +1437,17 @@ async fn handle_tcp(client: TcpStream, remote: Arc<String>, port: u16, retry_sec
                 .with_interval(Duration::from_secs(10)),
         );
     }
-    info!("[TCP:{port}] 隧道建立 {peer} ↔ {}", fmt_addr(&remote, port));
+    info!(
+        "[TCP:{port}] tunnel established {peer} ↔ {}",
+        fmt_addr(&remote, port)
+    );
 
     let (cr, cw) = io::split(client);
     let (ur, uw) = io::split(upstream);
     let (down, up) = tokio::join!(pipe(ur, cw), pipe(cr, uw));
-    info!("[TCP:{port}] 断开 {peer} ↓{down}B ↑{up}B");
+    metrics.tcp_down_bytes.fetch_add(down, Ordering::Relaxed);
+    metrics.tcp_up_bytes.fetch_add(up, Ordering::Relaxed);
+    info!("[TCP:{port}] disconnected {peer}; down={down}B up={up}B");
 }
 
 async fn run_tcp_forwarder(
@@ -749,41 +1455,39 @@ async fn run_tcp_forwarder(
     port: u16,
     remote: Arc<String>,
     retry_secs: u64,
+    metrics: Arc<RuntimeMetrics>,
 ) -> Result<()> {
     let bind = format!("{local_ip}:{port}");
     let listener = TcpListener::bind(&bind)
         .await
-        .with_context(|| format!("无法监听 {bind}（端口被占用？）"))?;
+        .with_context(|| format!("failed to listen on {bind}; port may be in use"))?;
 
     let desc = ROON_PORTS
         .iter()
         .find(|&&(p, _)| p == port)
         .map(|&(_, d)| d)
         .unwrap_or("custom");
-    info!("✓ TCP {bind} → {}  [{desc}]", fmt_addr(&remote, port));
+    info!("TCP {bind} -> {}  [{desc}]", fmt_addr(&remote, port));
 
     loop {
         match listener.accept().await {
             Ok((sock, _)) => {
                 let r = Arc::clone(&remote);
-                tokio::spawn(async move { handle_tcp(sock, r, port, retry_secs).await });
+                let m = Arc::clone(&metrics);
+                tokio::spawn(async move { handle_tcp(sock, r, port, retry_secs, m).await });
             }
             Err(e) => {
-                error!("[TCP:{port}] accept 错误: {e}");
+                error!("[TCP:{port}] accept error: {e}");
                 sleep(Duration::from_millis(100)).await;
             }
         }
     }
 }
 
-// ── 主程序 ────────────────────────────────────────────────────────────────────
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "roon_beacon=info".into()),
-        )
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "roon_beacon=info".into()))
         .without_time()
         .init();
 
@@ -792,115 +1496,117 @@ async fn main() -> Result<()> {
     let local_ip_v4: Ipv4Addr = args
         .local_ip
         .parse()
-        .with_context(|| format!("--local-ip '{}' 不是合法的 IPv4 地址", args.local_ip))?;
+        .with_context(|| format!("--local-ip '{}' is not a valid IPv4 address", args.local_ip))?;
 
     let first_octet = local_ip_v4.octets()[0];
     let second_octet = local_ip_v4.octets()[1];
     if first_octet == 100 && (64..=127).contains(&second_octet) {
-        warn!("⚠️  检测到 --local-ip 是 Tailscale IP（100.64.x.x）");
-        warn!("   SOOD 广播需要绑定到局域网网卡（如 192.168.x.x），否则 Roon Remote 发现不了");
-        warn!("   请用 `ip addr` 或 `ifconfig` 查看局域网 IP 后重新运行");
+        warn!("--local-ip looks like a Tailscale address (100.64.x.x)");
+        warn!("SOOD must bind to the LAN interface visible to Roon Remote clients");
+        warn!("Use `ip addr` or `ifconfig` to find the LAN address");
     }
     if local_ip_v4.is_loopback() {
-        anyhow::bail!("--local-ip 不能是 127.0.0.1，需要局域网 IP");
+        anyhow::bail!("--local-ip cannot be 127.0.0.1; use a LAN address");
     }
 
     let remote_ip_resolved = resolve_remote_host(&args.remote_ip, args.prefer).await?;
     if remote_ip_resolved != args.remote_ip {
         info!(
-            "🌐 域名解析: {} → {}  (prefer={:?})",
+            "Resolved remote host: {} -> {}  (prefer={:?})",
             args.remote_ip, remote_ip_resolved, args.prefer
         );
     }
 
     let remote = Arc::new(remote_ip_resolved.clone());
     let local_ip = args.local_ip.clone();
+    let runtime_config = Arc::new(RwLock::new(RuntimeConfig::from_args(&args)));
+    let metrics = Arc::new(RuntimeMetrics::default());
 
     println!();
-    println!("  ╔═══════════════════════════════════════════════════════╗");
-    println!(
-        "  ║             🎵  Roon Beacon  v{}                    ║",
-        env!("CARGO_PKG_VERSION")
-    );
-    println!("  ╠═══════════════════════════════════════════════════════╣");
-    println!(
-        "  ║  远端 NAS             : {:<32}║",
-        &remote_ip_resolved
-    );
-    println!("  ║  本机局域网 IP        : {:<32}║", local_ip);
-    println!("  ║  Core 显示名称        : {:<32}║", args.name);
-    println!(
-        "  ║  SOOD 广播间隔        : {:<32}║",
-        format!("{}s", args.broadcast_interval)
-    );
-    println!("  ╚═══════════════════════════════════════════════════════╝");
+    println!("  Roon Beacon v{}", env!("CARGO_PKG_VERSION"));
+    println!("  Remote Core       : {}", &remote_ip_resolved);
+    println!("  Local LAN IP      : {}", local_ip);
+    println!("  Web UI            : http://{WEB_UI_ADDR}");
+    println!("  Fallback Core Name: {}", args.name);
+    println!("  SOOD Interval     : {}s", args.broadcast_interval);
     println!();
-    println!("  ℹ️  Roon Remote 发现流程：");
+    println!("  Roon Remote discovery path:");
     println!(
-        "     Remote 发 SOOD 查询 → 本程序回复 \"Core 在 {}:{}\"",
+        "     Remote sends SOOD query -> roon-beacon answers with {}:{}",
         local_ip, ROON_DISCOVERY_PORT
     );
     println!(
-        "     Remote 连接 {}:{} → 本程序转发到 {}:{}",
+        "     Remote connects to {}:{} -> roon-beacon forwards to {}:{}",
         local_ip, ROON_DISCOVERY_PORT, &remote_ip_resolved, ROON_DISCOVERY_PORT
     );
     println!();
 
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    // 启动前：尝试从远端 Core 探测真实 SOOD 字段作为响应模板
+    // Capture a real Core SOOD template before serving clients.
     let template: Option<Arc<HashMap<String, String>>> = if args.no_probe {
-        info!("⏭  已禁用 Core 探测（--no-probe），使用内置字段模板");
+        info!("Core probing disabled by --no-probe; using built-in fallback template");
         None
     } else {
         match probe_core_template(&remote_ip_resolved, args.probe_timeout).await {
             Ok(tpl) => {
-                info!("🎯 将使用真实 Core 字段作为响应模板（{}个字段）", tpl.len());
+                info!(
+                    "Using real Core fields as fallback template ({} fields)",
+                    tpl.len()
+                );
                 Some(Arc::new(tpl))
             }
             Err(e) => {
-                warn!("⚠️  探测 Core 失败，退回使用内置模板: {e:#}");
+                warn!("Core probe failed; falling back to built-in template: {e:#}");
                 None
             }
         }
     };
 
-    // SOOD 发现服务
     {
         let lip = local_ip.clone();
-        let name = args.name.clone();
-        let bcast = args.broadcast_interval;
         let use_bcast = args.use_broadcast;
         let tpl = template.clone();
         let rip = remote_ip_resolved.clone();
-        let ptimeout = args.probe_timeout;
-        let rp = args.reverse_proxy;
-        let tsip = args.proxy_ip.clone();
+        let cfg = Arc::clone(&runtime_config);
+        let m = Arc::clone(&metrics);
         tasks.push(tokio::spawn(async move {
-            if let Err(e) = run_sood(
-                lip, name, bcast, use_bcast, tpl, rip, ptimeout, rp, tsip,
-            )
-            .await
-            {
-                error!("❌ SOOD 启动失败: {e:#}");
-                error!("   如果是权限问题：macOS/Linux 请加 sudo，Windows 请以管理员运行");
-                error!("   如果端口 9003 被占用：sudo lsof -i UDP:9003");
+            if let Err(e) = run_sood(lip, use_bcast, tpl, rip, cfg, m).await {
+                error!("SOOD service failed: {e:#}");
+                error!(
+                    "If UDP {SOOD_PORT} is in use, inspect it with `sudo lsof -i UDP:{SOOD_PORT}`"
+                );
             }
         }));
     }
 
-    // TCP 转发（所有 Roon 端口）
+    {
+        let state = WebState {
+            config: Arc::clone(&runtime_config),
+            metrics: Arc::clone(&metrics),
+            started_at: Instant::now(),
+            remote_ip: remote_ip_resolved.clone(),
+            local_ip: local_ip.clone(),
+            use_broadcast: args.use_broadcast,
+        };
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = run_web_ui(state).await {
+                warn!("Web UI is unavailable: {e:#}");
+            }
+        }));
+    }
+
     let skip: std::collections::HashSet<u16> = args.skip_ports.iter().copied().collect();
     for (port, desc) in ROON_PORTS {
         if skip.contains(port) {
-            info!("⏭  跳过 TCP :{port}  [{desc}]（--skip-ports）");
+            info!("Skipping TCP :{port} [{desc}] because of --skip-ports");
             continue;
         }
         match std::net::TcpListener::bind(format!("{}:{}", local_ip, port)) {
             Ok(l) => drop(l),
             Err(e) => {
-                warn!("⏭  跳过 TCP :{port}  [{desc}]（已被占用: {e}）");
-                warn!("   这通常是本机 Roon Bridge / RAATServer 在用，正常现象");
+                warn!("Skipping TCP :{port} [{desc}] because the port is unavailable: {e}");
+                warn!("This is common when local Roon Bridge or RAATServer already owns the port");
                 continue;
             }
         }
@@ -908,23 +1614,28 @@ async fn main() -> Result<()> {
         let r = Arc::clone(&remote);
         let port = *port;
         let retry = args.retry_secs;
+        let m = Arc::clone(&metrics);
         tasks.push(tokio::spawn(async move {
-            if let Err(e) = run_tcp_forwarder(lip, port, r, retry).await {
-                error!("❌ TCP 转发器 :{port} 失败: {e:#}");
+            if let Err(e) = run_tcp_forwarder(lip, port, r, retry, m).await {
+                error!("TCP forwarder :{port} failed: {e:#}");
             }
         }));
     }
 
-    info!("🚀 运行中（Ctrl+C 退出）");
-    info!("   等待 Roon Remote 扫描...");
+    info!("Running; press Ctrl+C to stop");
+    info!("Waiting for Roon Remote discovery scans");
     info!(
-        "   若 30s 内未发现：Roon Remote → 设置 → Roon Core → 手动连接 → {}",
+        "If discovery does not appear after 30s, add the Core manually with local IP {}",
         local_ip
     );
     println!();
 
-    for t in tasks {
-        let _ = t.await;
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed to listen for Ctrl+C")?;
+    info!("Shutdown requested; stopping services");
+    for task in tasks {
+        task.abort();
     }
     Ok(())
 }
@@ -935,6 +1646,16 @@ mod tests {
 
     fn prop<'a>(msg: &'a SoodMessage, key: &str) -> Option<&'a str> {
         msg.props.get(key).and_then(|v| v.as_deref())
+    }
+
+    #[test]
+    fn normalizes_optional_proxy_ip() {
+        assert_eq!(normalized_optional_string(None), None);
+        assert_eq!(normalized_optional_string(Some("   ".to_string())), None);
+        assert_eq!(
+            normalized_optional_string(Some("  100.64.0.10  ".to_string())),
+            Some("100.64.0.10".to_string())
+        );
     }
 
     #[test]
@@ -951,14 +1672,9 @@ mod tests {
         let msg = roon_sood::parse(&packet, src).unwrap();
 
         assert_eq!(msg.msg_type, SoodType::Query);
+        assert_eq!(msg.props.get("_tid").and_then(|v| v.as_deref()), Some("42"));
         assert_eq!(
-            msg.props.get("_tid").and_then(|v| v.as_deref()),
-            Some("42")
-        );
-        assert_eq!(
-            msg.props
-                .get("query_service_id")
-                .and_then(|v| v.as_deref()),
+            msg.props.get("query_service_id").and_then(|v| v.as_deref()),
             Some(ROON_CORE_SERVICE_ID)
         );
         assert_eq!(msg.from, src);
@@ -1005,8 +1721,7 @@ mod tests {
 
     #[test]
     fn builds_core_response_on_roon_discovery_port() {
-        let packet =
-            make_sood_response("45", "Roon Core (Beacon)", "192.168.1.10").unwrap();
+        let packet = make_sood_response("45", "Roon Core (Beacon)", "192.168.1.10").unwrap();
         let src: SocketAddr = "192.168.1.50:55000".parse().unwrap();
 
         let msg = roon_sood::parse(&packet, src).unwrap();
