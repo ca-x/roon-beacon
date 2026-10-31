@@ -19,7 +19,7 @@ docker compose exec roon-beacon cat /data/web-access-token
 
 访问 `http://<Docker宿主机IP>:9339`，输入上述 token。在 **Roon 设置 → 扩展** 中启用 **Roon Beacon**，然后在网页选择 Server 和播放区域。界面支持中文/English、播放暂停、切歌、进度跳转、音量、静音、媒体库和搜索；根据输出设备能力禁用不支持的操作。
 
-镜像地址：`ghcr.io/ca-x/roon-beacon:0.2.0`，支持 `linux/amd64` 与 `linux/arm64`。`latest` 跟随稳定版本，推荐固定版本或 digest。Compose 使用 `network_mode: host`，让 SOOD 与 AirPlay/mDNS 进入真实局域网；Docker Desktop 的普通 bridge 网络不能等价替代。
+镜像地址：`ghcr.io/ca-x/roon-beacon:0.2.1`，支持 `linux/amd64` 与 `linux/arm64`。`latest` 跟随稳定版本，推荐固定版本或 digest。Compose 使用 `network_mode: host`，让 SOOD 与 AirPlay/mDNS 进入真实局域网；Docker Desktop 的普通 bridge 网络不能等价替代。
 
 保留 `/data` 持久卷，它保存 Roon 授权和所选 Server。非 loopback Web 监听强制启用访问 token；没有设置时自动生成私有文件。可选环境变量 `ROON_BEACON_WEB_TOKEN`：16–256 个 ASCII 字母、数字、`-`、`_` 或 `.`。不要直接暴露公网，优先使用可信局域网、VPN 或 HTTPS 反向代理；代理需保留浏览器访问的 `Host`，以通过同源校验。
 
@@ -38,6 +38,10 @@ cargo run --release -- --enable-audio --audio-name "Roon Beacon Web" --data-dir 
 3. 在网页点击 **加入音频 / Join audio**，将音频送到当前浏览器的扬声器或耳机。浏览器要求主动点击，不会自动出声。
 
 音频链路：`Roon Server → AirPlay → Shairport Sync → PCM → FFmpeg MP3 → 浏览器`。
+
+多网卡设备可在 **连接与运行设置 → 浏览器音频网络** 选择 Roon 能访问的局域网网卡；选项会显示网卡名称及地址。「自动选择」恢复接收器默认行为。该设置保存在数据目录的 `audio-network.json`，保存仅重启音频接收器和编码器，不改变 Core 连接、Web 地址或手机播放控制，也不需要部署参数或重建容器。更改后请在 Roon 重新选择 Beacon 输出，并在网页重新加入收听。已保存的网卡消失时，音频会报错，但网页设置仍可使用，便于改选其他网卡或自动选择。
+
+Web 域名并非 Roon 发送 AirPlay 音频的目标地址。如果网页已连接却一直等待音频，请展开「音频诊断」：`pcm_bytes_received` 是接收器的 PCM 输入字节数，`bytes_streamed` 是编码后的 MP3 字节数，均从程序启动开始累计；同时会显示有界的接收器、编码器日志。单看 MP3 为零不能判断具体故障点；如果 Roon 播放区域立即停止，还需查看 Roon 的播放错误。选择网卡是排查手段，不表示所有无声问题都已解决。
 
 - 这是**实验性的共享 AirPlay 输出**，不是每个浏览器一个独立 Roon Zone，也不冒充原生 Roon Bridge。
 - MP3 是有损编码，会有缓冲延迟；不同浏览器之间不保证同步，不承诺 RAAT 等级的音质和同步。
