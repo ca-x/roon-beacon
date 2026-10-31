@@ -1,106 +1,28 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Roon Beacon</title>
-  <link rel="stylesheet" href="/assets/styles.css">
-  <script src="/assets/app.js" defer></script>
-</head>
-<body>
-  <div class="shell">
-    <header>
-      <div class="brand">
-        <div class="mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="8"></circle>
-            <path d="M8 12h8M12 8v8"></path>
-          </svg>
-        </div>
-        <div>
-          <h1>Roon Beacon</h1>
-          <p class="subtitle" data-i18n="subtitle">Local discovery bridge for a remote Roon Core</p>
-        </div>
-      </div>
-      <div class="lang" role="group" aria-label="Language">
-        <button type="button" data-lang="en">EN</button>
-        <button type="button" data-lang="zh">中文</button>
-      </div>
-    </header>
-
-    <main>
-      <section class="panel">
-        <div class="panel-head">
-          <h2 data-i18n="signal">Signal Path</h2>
-          <div class="status-pill"><span class="dot"></span><span data-i18n="running">Running</span></div>
-        </div>
-        <div class="route">
-          <div class="route-line">
-            <div class="endpoint">
-              <div class="label" data-i18n="local">Local LAN</div>
-              <div class="value" id="localIp">-</div>
-              <div class="label" id="localPorts">SOOD 9003 · TCP 9330</div>
-            </div>
-            <div class="transport" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M5 12h14"></path>
-                <path d="m13 6 6 6-6 6"></path>
-              </svg>
-            </div>
-            <div class="endpoint">
-              <div class="label" data-i18n="remote">Remote Core</div>
-              <div class="value" id="remoteIp">-</div>
-              <div class="label" id="mode">-</div>
-            </div>
-          </div>
-          <div class="metrics">
-            <div class="metric"><div class="label" data-i18n="queries">SOOD Queries</div><div class="num" id="q">0</div></div>
-            <div class="metric"><div class="label" data-i18n="live">Live Core</div><div class="num" id="live">0</div></div>
-            <div class="metric"><div class="label" data-i18n="fallback">Fallbacks</div><div class="num" id="fallback">0</div></div>
-            <div class="metric"><div class="label" data-i18n="tcp">TCP Sessions</div><div class="num" id="tcp">0</div></div>
-          </div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head">
-          <h2 data-i18n="runtime">Runtime</h2>
-        </div>
-        <form id="configForm">
-          <label class="field">
-            <span data-i18n="name">Fallback display name</span>
-            <input id="name" name="name" autocomplete="off">
-          </label>
-          <label class="field">
-            <span data-i18n="interval">Announcement interval, seconds</span>
-            <input id="broadcastInterval" name="broadcastInterval" type="number" min="0" max="3600">
-          </label>
-          <label class="field">
-            <span data-i18n="timeout">Live SOOD timeout, ms</span>
-            <input id="liveTimeout" name="liveTimeout" type="number" min="100" max="10000">
-          </label>
-          <label class="switch">
-            <span data-i18n="reverse">Reverse SOOD proxy</span>
-            <input id="reverseProxy" name="reverseProxy" type="checkbox">
-          </label>
-          <label class="field">
-            <span data-i18n="proxyIp">Reachable proxy IP</span>
-            <input id="proxyIp" name="proxyIp" autocomplete="off">
-          </label>
-          <div class="actions">
-            <button class="primary" type="submit">
-              <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M20 6 9 17l-5-5"></path>
-              </svg>
-              <span data-i18n="save">Save</span>
-            </button>
-            <span class="feedback" id="feedback"></span>
-          </div>
-        </form>
-      </section>
-    </main>
-
-    <footer><span data-i18n="uptime">Uptime</span>: <span id="uptime">0s</span></footer>
-  </div>
-</body>
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f7f5f1">
+    <script>
+      (() => {
+        let preference = 'system';
+        try { preference = localStorage.getItem('roonBeaconTheme') || 'system'; } catch {}
+        const theme = preference === 'dark' || (preference !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.style.colorScheme = theme;
+        document.querySelector('meta[name="theme-color"]').content = theme === 'dark' ? '#191918' : '#f7f5f1';
+      })();
+    </script>
+    <meta name="description" content="Your Roon library, listening zones, and experimental browser audio in one remote.">
+    <title>Roon Beacon</title>
+    <link rel="icon" type="image/png" href="/assets/favicon.png">
+    <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+    <script type="module" crossorigin src="/assets/app.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/styles.css">
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>JavaScript is required to control Roon. / 需要启用 JavaScript 才能控制 Roon。</noscript>
+  </body>
 </html>

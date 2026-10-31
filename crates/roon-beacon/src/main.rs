@@ -3,6 +3,11 @@
 //! Runs inside the local LAN and presents a remote Roon Core as a local SOOD
 //! beacon plus TCP forwarding endpoint.
 
+mod audio;
+mod auth;
+mod persistence;
+mod player;
+
 use anyhow::{Context, Result};
 use axum::{
     extract::State,
@@ -15,6 +20,7 @@ use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -58,7 +64,7 @@ const ROON_PORTS: &[(u16, &str)] = &[
     (55000, "Roon Core HTTPS"),
 ];
 
-/// Roon Beacon publishes a remote Roon Core into the local LAN.
+/// Discover Roon Servers, control music from the Web, and optionally bridge a remote Core.
 ///
 /// `--local-ip` must be the LAN address visible to Roon Remote clients, not a
 /// VPN/overlay address and not 127.0.0.1.
@@ -66,12 +72,32 @@ const ROON_PORTS: &[(u16, &str)] = &[
 #[command(author, version, about)]
 struct Args {
     /// Remote Roon Core host. IP addresses, host names, and DNS names are supported.
-    #[arg(short = 'r', long, value_name = "HOST")]
-    remote_ip: String,
+    #[arg(short = 'r', long, value_name = "HOST", requires = "local_ip")]
+    remote_ip: Option<String>,
 
     /// Local LAN IP in the same network as Roon Remote clients.
     #[arg(short = 'l', long, value_name = "IP")]
-    local_ip: String,
+    local_ip: Option<String>,
+
+    /// Web server address. Non-loopback binds enable access-token authentication.
+    #[arg(long, default_value = WEB_UI_ADDR)]
+    web_bind: SocketAddr,
+
+    /// Private directory for authorization state and generated Web access token.
+    #[arg(long, default_value = "data")]
+    data_dir: PathBuf,
+
+    /// Web access token (16–256 ASCII letters, digits, '-', '_' or '.').
+    #[arg(long, env = "ROON_BEACON_WEB_TOKEN", hide_env_values = true)]
+    web_token: Option<String>,
+
+    /// Enable the experimental AirPlay-to-browser audio receiver.
+    #[arg(long)]
+    enable_audio: bool,
+
+    /// AirPlay output name shown in Roon Settings > Audio.
+    #[arg(long, default_value = "Roon Beacon Web")]
+    audio_name: String,
 
     /// Fallback Core name shown in Roon Remote when live SOOD proxying is unavailable.
     #[arg(short = 'n', long, default_value = "Roon Core (Beacon)")]
@@ -179,9 +205,10 @@ struct WebState {
     config: Arc<RwLock<RuntimeConfig>>,
     metrics: Arc<RuntimeMetrics>,
     started_at: Instant,
-    remote_ip: String,
+    remote_ip: Option<String>,
     local_ip: String,
     use_broadcast: bool,
+    web_bind: SocketAddr,
 }
 
 #[derive(Deserialize)]
@@ -196,11 +223,12 @@ struct UpdateConfig {
 #[derive(Serialize)]
 struct StatusResponse {
     version: &'static str,
-    remote_ip: String,
+    remote_ip: Option<String>,
     local_ip: String,
     sood_port: u16,
     discovery_port: u16,
-    web_ui_addr: &'static str,
+    web_ui_addr: String,
+    forwarding_enabled: bool,
     use_broadcast: bool,
     uptime_secs: u64,
     config: RuntimeConfig,
@@ -225,7 +253,8 @@ async fn status_snapshot(state: &WebState) -> StatusResponse {
         local_ip: state.local_ip.clone(),
         sood_port: SOOD_PORT,
         discovery_port: ROON_DISCOVERY_PORT,
-        web_ui_addr: WEB_UI_ADDR,
+        web_ui_addr: state.web_bind.to_string(),
+        forwarding_enabled: state.remote_ip.is_some(),
         use_broadcast: state.use_broadcast,
         uptime_secs: state.started_at.elapsed().as_secs(),
         config: state.config.read().await.clone(),
@@ -256,6 +285,18 @@ async fn web_script() -> impl IntoResponse {
 
 async fn web_favicon() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+async fn web_logo() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], WEB_LOGO)
+}
+
+async fn web_favicon_png() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], WEB_FAVICON)
+}
+
+async fn web_touch_icon() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], WEB_TOUCH_ICON)
 }
 
 async fn api_status(State(state): State<WebState>) -> Json<StatusResponse> {
@@ -302,20 +343,38 @@ async fn api_update_config(
     Ok(Json(status_snapshot(&state).await))
 }
 
-async fn run_web_ui(state: WebState) -> Result<()> {
+async fn run_web_ui(
+    listener: TcpListener,
+    state: WebState,
+    player: player::Player,
+    audio: audio::AudioGateway,
+    auth: auth::WebAuth,
+) -> Result<()> {
     let router = Router::new()
         .route("/", get(web_index))
         .route("/assets/styles.css", get(web_styles))
         .route("/assets/app.js", get(web_script))
         .route("/favicon.ico", get(web_favicon))
+        .route("/assets/logo.png", get(web_logo))
+        .route("/assets/favicon.png", get(web_favicon_png))
+        .route("/assets/apple-touch-icon.png", get(web_touch_icon))
+        .route("/favicon.png", get(web_favicon_png))
+        .route("/apple-touch-icon.png", get(web_touch_icon))
         .route("/api/status", get(api_status))
         .route("/api/config", post(api_update_config))
-        .with_state(state);
+        .route(
+            "/api/health",
+            get(|| async {
+                Json(serde_json::json!({"status":"ok","version":env!("CARGO_PKG_VERSION")}))
+            }),
+        )
+        .with_state(state)
+        .merge(player.router())
+        .merge(audio.router())
+        .merge(auth.router())
+        .layer(axum::middleware::from_fn_with_state(auth, auth::protect));
 
-    let listener = TcpListener::bind(WEB_UI_ADDR)
-        .await
-        .with_context(|| format!("failed to bind Web UI at http://{WEB_UI_ADDR}"))?;
-    info!("Web UI listening at http://{WEB_UI_ADDR}");
+    info!("Web UI listening at http://{}", listener.local_addr()?);
     axum::serve(listener, router)
         .await
         .context("Web UI server failed")
@@ -324,6 +383,9 @@ async fn run_web_ui(state: WebState) -> Result<()> {
 const WEB_UI_HTML: &str = include_str!("web/index.html");
 const WEB_UI_CSS: &str = include_str!("web/styles.css");
 const WEB_UI_JS: &str = include_str!("web/app.js");
+const WEB_LOGO: &[u8] = include_bytes!("web/logo.png");
+const WEB_FAVICON: &[u8] = include_bytes!("web/favicon.png");
+const WEB_TOUCH_ICON: &[u8] = include_bytes!("web/apple-touch-icon.png");
 
 fn hex_dump(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 4);
@@ -1008,151 +1070,186 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let local_ip_v4: Ipv4Addr = args
+    if let Some(local_ip) = &args.local_ip {
+        let address: Ipv4Addr = local_ip
+            .parse()
+            .context("--local-ip must be a valid IPv4 LAN address")?;
+        if address.is_loopback()
+            || address.is_unspecified()
+            || address.is_multicast()
+            || address.is_broadcast()
+        {
+            anyhow::bail!(
+                "--local-ip must be a usable LAN address, not loopback, wildcard or multicast"
+            );
+        }
+        if address.octets()[0] == 100 && (64..=127).contains(&address.octets()[1]) {
+            warn!("--local-ip looks like a Tailscale address; use the LAN address visible to Roon Remote");
+        }
+    }
+    let remote_ip_resolved = match &args.remote_ip {
+        Some(host) => Some(resolve_remote_host(host, args.prefer).await?),
+        None => None,
+    };
+    let store = persistence::SecureState::open(&args.data_dir)?;
+    let auth = auth::WebAuth::open(args.web_bind, &args.data_dir, args.web_token.clone())?;
+    let listener = TcpListener::bind(args.web_bind)
+        .await
+        .with_context(|| format!("cannot bind Web UI to {}", args.web_bind))?;
+    let player = player::Player::new(store)?;
+    let audio = audio::AudioGateway::start(
+        args.enable_audio,
+        args.audio_name.clone(),
+        args.data_dir.clone(),
+    )
+    .await?;
+    player
+        .start_discovery(
+            args.remote_ip.is_some(),
+            remote_ip_resolved
+                .as_ref()
+                .and_then(|host| host.parse().ok()),
+        )
+        .await;
+    let local_ip = args
         .local_ip
-        .parse()
-        .with_context(|| format!("--local-ip '{}' is not a valid IPv4 address", args.local_ip))?;
-
-    let first_octet = local_ip_v4.octets()[0];
-    let second_octet = local_ip_v4.octets()[1];
-    if first_octet == 100 && (64..=127).contains(&second_octet) {
-        warn!("--local-ip looks like a Tailscale address (100.64.x.x)");
-        warn!("SOOD must bind to the LAN interface visible to Roon Remote clients");
-        warn!("Use `ip addr` or `ifconfig` to find the LAN address");
-    }
-    if local_ip_v4.is_loopback() {
-        anyhow::bail!("--local-ip cannot be 127.0.0.1; use a LAN address");
-    }
-
-    let remote_ip_resolved = resolve_remote_host(&args.remote_ip, args.prefer).await?;
-    if remote_ip_resolved != args.remote_ip {
-        info!(
-            "Resolved remote host: {} -> {}  (prefer={:?})",
-            args.remote_ip, remote_ip_resolved, args.prefer
-        );
-    }
-
-    let remote = Arc::new(remote_ip_resolved.clone());
-    let local_ip = args.local_ip.clone();
+        .clone()
+        .unwrap_or_else(|| "0.0.0.0".to_string());
     let runtime_config = Arc::new(RwLock::new(RuntimeConfig::from_args(&args)));
     let metrics = Arc::new(RuntimeMetrics::default());
 
     println!();
     println!("  Roon Beacon v{}", env!("CARGO_PKG_VERSION"));
-    println!("  Remote Core       : {}", &remote_ip_resolved);
+    println!(
+        "  Mode              : {}",
+        if remote_ip_resolved.is_some() {
+            "Bridge + Web player"
+        } else {
+            "Web player"
+        }
+    );
+    if let Some(remote) = &remote_ip_resolved {
+        println!("  Remote Core       : {remote}");
+    }
     println!("  Local LAN IP      : {}", local_ip);
-    println!("  Web UI            : http://{WEB_UI_ADDR}");
+    println!("  Web UI            : http://{}", args.web_bind);
     println!("  Fallback Core Name: {}", args.name);
     println!("  SOOD Interval     : {}s", args.broadcast_interval);
     println!();
-    println!("  Roon Remote discovery path:");
-    println!(
-        "     Remote sends SOOD query -> roon-beacon answers with {}:{}",
-        local_ip, ROON_DISCOVERY_PORT
-    );
-    println!(
-        "     Remote connects to {}:{} -> roon-beacon forwards to {}:{}",
-        local_ip, ROON_DISCOVERY_PORT, &remote_ip_resolved, ROON_DISCOVERY_PORT
-    );
-    println!();
-
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-
-    // Capture a real Core SOOD template before serving clients.
-    let template: Option<Arc<HashMap<String, String>>> = if args.no_probe {
-        info!("Core probing disabled by --no-probe; using built-in fallback template");
-        None
-    } else {
-        match probe_core_template(&remote_ip_resolved, args.probe_timeout).await {
-            Ok(tpl) => {
-                info!(
-                    "Using real Core fields as fallback template ({} fields)",
-                    tpl.len()
-                );
-                Some(Arc::new(tpl))
+    if let Some(remote_ip_resolved) = &remote_ip_resolved {
+        let remote = Arc::new(remote_ip_resolved.clone());
+        let template: Option<Arc<HashMap<String, String>>> = if args.no_probe {
+            info!("Core probing disabled by --no-probe; using built-in fallback template");
+            None
+        } else {
+            match probe_core_template(remote_ip_resolved, args.probe_timeout).await {
+                Ok(tpl) => {
+                    info!(
+                        "Using real Core fields as fallback template ({} fields)",
+                        tpl.len()
+                    );
+                    Some(Arc::new(tpl))
+                }
+                Err(e) => {
+                    warn!("Core probe failed; falling back to built-in template: {e:#}");
+                    None
+                }
             }
-            Err(e) => {
-                warn!("Core probe failed; falling back to built-in template: {e:#}");
-                None
-            }
-        }
-    };
+        };
 
-    {
-        let lip = local_ip.clone();
-        let use_bcast = args.use_broadcast;
-        let tpl = template.clone();
-        let rip = remote_ip_resolved.clone();
-        let cfg = Arc::clone(&runtime_config);
-        let m = Arc::clone(&metrics);
-        tasks.push(tokio::spawn(async move {
-            if let Err(e) = run_sood(lip, use_bcast, tpl, rip, cfg, m).await {
-                error!("SOOD service failed: {e:#}");
-                error!(
+        {
+            let lip = local_ip.clone();
+            let use_bcast = args.use_broadcast;
+            let tpl = template.clone();
+            let rip = remote_ip_resolved.clone();
+            let cfg = Arc::clone(&runtime_config);
+            let m = Arc::clone(&metrics);
+            tasks.push(tokio::spawn(async move {
+                if let Err(e) = run_sood(lip, use_bcast, tpl, rip, cfg, m).await {
+                    error!("SOOD service failed: {e:#}");
+                    error!(
                     "If UDP {SOOD_PORT} is in use, inspect it with `sudo lsof -i UDP:{SOOD_PORT}`"
                 );
-            }
-        }));
-    }
-
-    {
-        let state = WebState {
-            config: Arc::clone(&runtime_config),
-            metrics: Arc::clone(&metrics),
-            started_at: Instant::now(),
-            remote_ip: remote_ip_resolved.clone(),
-            local_ip: local_ip.clone(),
-            use_broadcast: args.use_broadcast,
-        };
-        tasks.push(tokio::spawn(async move {
-            if let Err(e) = run_web_ui(state).await {
-                warn!("Web UI is unavailable: {e:#}");
-            }
-        }));
-    }
-
-    let skip: std::collections::HashSet<u16> = args.skip_ports.iter().copied().collect();
-    for (port, desc) in ROON_PORTS {
-        if skip.contains(port) {
-            info!("Skipping TCP :{port} [{desc}] because of --skip-ports");
-            continue;
+                }
+            }));
         }
-        match std::net::TcpListener::bind(format!("{}:{}", local_ip, port)) {
-            Ok(l) => drop(l),
-            Err(e) => {
-                warn!("Skipping TCP :{port} [{desc}] because the port is unavailable: {e}");
-                warn!("This is common when local Roon Bridge or RAATServer already owns the port");
+
+        let skip: std::collections::HashSet<u16> = args.skip_ports.iter().copied().collect();
+        for (port, desc) in ROON_PORTS {
+            if skip.contains(port) {
+                info!("Skipping TCP :{port} [{desc}] because of --skip-ports");
                 continue;
             }
-        }
-        let lip = local_ip.clone();
-        let r = Arc::clone(&remote);
-        let port = *port;
-        let retry = args.retry_secs;
-        let m = Arc::clone(&metrics);
-        tasks.push(tokio::spawn(async move {
-            if let Err(e) = run_tcp_forwarder(lip, port, r, retry, m).await {
-                error!("TCP forwarder :{port} failed: {e:#}");
+            match std::net::TcpListener::bind(format!("{}:{}", local_ip, port)) {
+                Ok(l) => drop(l),
+                Err(e) => {
+                    warn!("Skipping TCP :{port} [{desc}] because the port is unavailable: {e}");
+                    warn!(
+                        "This is common when local Roon Bridge or RAATServer already owns the port"
+                    );
+                    continue;
+                }
             }
-        }));
+            let lip = local_ip.clone();
+            let r = Arc::clone(&remote);
+            let port = *port;
+            let retry = args.retry_secs;
+            let m = Arc::clone(&metrics);
+            tasks.push(tokio::spawn(async move {
+                if let Err(e) = run_tcp_forwarder(lip, port, r, retry, m).await {
+                    error!("TCP forwarder :{port} failed: {e:#}");
+                }
+            }));
+        }
     }
-
-    info!("Running; press Ctrl+C to stop");
-    info!("Waiting for Roon Remote discovery scans");
+    let state = WebState {
+        config: Arc::clone(&runtime_config),
+        metrics: Arc::clone(&metrics),
+        started_at: Instant::now(),
+        remote_ip: remote_ip_resolved,
+        local_ip,
+        use_broadcast: args.use_broadcast,
+        web_bind: args.web_bind,
+    };
+    let mut web_task = tokio::spawn(run_web_ui(
+        listener,
+        state,
+        player.clone(),
+        audio.clone(),
+        auth,
+    ));
     info!(
-        "If discovery does not appear after 30s, add the Core manually with local IP {}",
-        local_ip
+        "Running; enable Roon Beacon in Roon Settings → Extensions to authorize playback control"
     );
-    println!();
-
-    tokio::signal::ctrl_c()
-        .await
-        .context("failed to listen for Ctrl+C")?;
+    let outcome = tokio::select! {
+        result = shutdown_signal() => result,
+        result = &mut web_task => Err(anyhow::anyhow!("Web server stopped unexpectedly: {result:?}")),
+    };
     info!("Shutdown requested; stopping services");
+    web_task.abort();
     for task in tasks {
         task.abort();
     }
-    Ok(())
+    player.shutdown().await;
+    audio.shutdown().await;
+    outcome
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("cannot listen for Ctrl+C"),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .context("cannot listen for Ctrl+C")
 }
 
 #[cfg(test)]
@@ -1177,8 +1274,27 @@ mod tests {
     fn embedded_web_ui_uses_split_assets() {
         assert!(WEB_UI_HTML.contains(r#"href="/assets/styles.css""#));
         assert!(WEB_UI_HTML.contains(r#"src="/assets/app.js""#));
-        assert!(WEB_UI_CSS.contains(".shell"));
-        assert!(WEB_UI_JS.contains("loadStatus"));
+        assert!(WEB_UI_HTML.contains(r#"href="/assets/favicon.png""#));
+        assert!(WEB_UI_HTML.contains(r#"href="/assets/apple-touch-icon.png""#));
+        assert!(!WEB_UI_CSS.is_empty());
+        assert!(WEB_UI_HTML.contains(r#"type="module""#));
+        assert!(!WEB_UI_JS.is_empty());
+    }
+
+    #[test]
+    fn supplied_branding_is_embedded_as_transparent_png_assets() {
+        for (bytes, dimension) in [(WEB_LOGO, 256u32), (WEB_FAVICON, 64), (WEB_TOUCH_ICON, 180)] {
+            assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+            assert_eq!(
+                u32::from_be_bytes(bytes[16..20].try_into().unwrap()),
+                dimension
+            );
+            assert_eq!(
+                u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
+                dimension
+            );
+            assert_eq!(bytes[25], 6);
+        }
     }
 
     #[test]

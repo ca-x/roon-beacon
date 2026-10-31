@@ -1,0 +1,15 @@
+.git
+.github
+.env
+.env.*
+target
+**/target
+node_modules
+**/node_modules
+data
+*.log
+.firecrawl
+.superpowers
+.worktrees
+.qa
+dist

@@ -1,12 +1,62 @@
 # Roon Beacon
 
+## v0.2：Web 遥控与浏览器播放
+
+本版保留原有跨网络发现/转发，同时新增局域网 Roon Server 自动发现、扩展授权持久化、Web 播放遥控、媒体库浏览/搜索、专辑封面及实验性的浏览器音频输出。**它不是原生 RAAT/Roon Bridge 实现。**
+
+前端采用 React、TypeScript、Vite 和 React Cupertino UI 组件；实现源码位于 `web/`，构建后的静态资源随 Rust 二进制嵌入。修改前端后运行 `npm --prefix web ci && npm --prefix web run check && npm --prefix web run build`，再执行 Cargo 构建。Docker 使用独立 Node 构建阶段，运行时不需要 Node 服务。
+
+界面使用项目提供的 Logo，支持中英文切换，以及浅色、深色、跟随系统三种主题；语言和主题选择保存在当前浏览器。
+
+浏览器回归测试：安装 `agent-browser` 及其 Chromium 后，运行 `python3 tests/frontend_qa.py`。测试使用隔离的 mock 服务，不会控制你的 Roon Server。
+
+### Docker 部署（Linux）
+
+```bash
+docker compose up -d
+docker compose exec roon-beacon cat /data/web-access-token
+```
+
+访问 `http://<Docker宿主机IP>:9339`，输入上述 token。在 **Roon 设置 → 扩展** 中启用 **Roon Beacon**，然后在网页选择 Server 和播放区域。界面支持中文/English、播放暂停、切歌、进度跳转、音量、静音、媒体库和搜索；根据输出设备能力禁用不支持的操作。
+
+镜像地址：`ghcr.io/ca-x/roon-beacon:0.2.0`，支持 `linux/amd64` 与 `linux/arm64`。`latest` 跟随稳定版本，推荐固定版本或 digest。Compose 使用 `network_mode: host`，让 SOOD 与 AirPlay/mDNS 进入真实局域网；Docker Desktop 的普通 bridge 网络不能等价替代。
+
+保留 `/data` 持久卷，它保存 Roon 授权和所选 Server。非 loopback Web 监听强制启用访问 token；没有设置时自动生成私有文件。可选环境变量 `ROON_BEACON_WEB_TOKEN`：16–256 个 ASCII 字母、数字、`-`、`_` 或 `.`。不要直接暴露公网，优先使用可信局域网、VPN 或 HTTPS 反向代理；代理需保留浏览器访问的 `Host`，以通过同源校验。
+
+无 token 的 loopback 访问只接受 `localhost` 或 loopback IP 的 Host，以防 DNS rebinding；若通过其他域名代理 loopback 监听，请显式配置 Web token。
+
+### 让浏览器真正出声
+
+镜像包含接收器和编码器。使用独立二进制时，需安装支持 **stdout backend** 的 Shairport Sync、支持 libmp3lame 的 FFmpeg，并运行 Avahi/mDNS 服务：
+
+```bash
+cargo run --release -- --enable-audio --audio-name "Roon Beacon Web" --data-dir ./data
+```
+
+1. 在 **Roon 设置 → 音频** 中启用 AirPlay 设备 **Roon Beacon Web**。
+2. 在 Roon 或网页中选择该区域，并开始播放。
+3. 在网页点击 **加入音频 / Join audio**，将音频送到当前浏览器的扬声器或耳机。浏览器要求主动点击，不会自动出声。
+
+音频链路：`Roon Server → AirPlay → Shairport Sync → PCM → FFmpeg MP3 → 浏览器`。
+
+- 这是**实验性的共享 AirPlay 输出**，不是每个浏览器一个独立 Roon Zone，也不冒充原生 Roon Bridge。
+- MP3 是有损编码，会有缓冲延迟；不同浏览器之间不保证同步，不承诺 RAAT 等级的音质和同步。
+- 网页退出收听不会暂停共享的 Roon Zone；其他浏览器可以继续收听。
+- 接收端必须能被 Roon Server 通过 mDNS 发现且网络可达。原有 SOOD 反向代理**不负责转发 AirPlay/mDNS**，远端 Core 通过 VPN 接入时需另行解决这条链路。
+- 无需宿主机声卡，不必挂载 `/dev/snd`。缺失接收器/编码器时，网页显示真实错误。
+- 自动化验证使用 mock Core 和合成音频，不等于真实 Roon 环境已验收。
+
+### 新启动方式
+
+不传 `--remote-ip` 时，仅运行自动发现和 Web 播放器，不打开原有转发端口。Web 默认只监听 `127.0.0.1:9339`；`--web-bind` 可修改监听地址，`--data-dir` 指定持久目录，`--enable-audio` 启用音频网关。原有跨网络桥接命令继续可用，但 `--remote-ip` 必须搭配 `--local-ip`。以下旧版文档主要介绍桥接模式。
+
 [English](README.md) | 简体中文
 
 把远端网络的 Roon Core 信标广播到本地局域网，让本地 Roon Remote / Control 客户端可以跨网段发现并使用它。
 
 ## 技术实现
 
-SOOD 协议的二进制解析、序列化、常量定义直接使用 [roon-rs](https://github.com/shin1ohno/roon-rs) 项目的 `roon-sood` crate，复制到本地 `crates/roon-sood/` 作为 workspace member。roon-beacon 自身只做桥接逻辑（SOOD 代理、TCP 转发、域名解析），不重新实现协议编解码。
+SOOD 协议的二进制解析、序列化、常量定义复用 [roon-rs](https://github.com/shin1ohno/roon-rs) 项目的 `roon-sood` crate，复制到本地 `crates/roon-sood/` 作为 workspace member；本版补充了 Core 服务类型和端口校验。播放控制的 MOO/WebSocket 编解码复用 `roon-moo`，程序负责连接、授权、重连和 Web 接口。
 
 ## 它解决的问题
 
@@ -35,7 +85,7 @@ Roon Beacon 运行在**客户端所在的局域网**里，作为一个"SOOD 信�
 
 ### 前置条件
 
-- Rust 1.70+ / Cargo
+- 当前 stable Rust / Cargo（锁定依赖要求 Rust 1.88 或更新版本）
 - 本机有一张网卡在客户端所在的局域网（比如 `192.168.1.x`）
 - 本机能通过某种方式（VPN / Tailscale / 端口映射）直连到远端 Core 的 UDP 9003 和 TCP 9100-9332 / 55000
 - 远端的 Roon Core / Roon Server 已经在运行
@@ -336,7 +386,7 @@ sudo systemctl restart roonbridge.service
 - **Roon ARC**（官方订阅服务）
 - 在手机上跑一个能充当 RAAT Bridge 的第三方 app（Roon 没提供官方 SDK）
 
-Roon Beacon 只负责 Core 发现和转发，没法改变 Roon 的这个限制。
+上述限制针对原有 Roon Remote/RAAT 桥接路径。v0.2 新增的 Web 音频网关可以让手机浏览器通过独立 AirPlay→MP3 链路出声，详见本文开头；它不会把手机 Roon Remote 变成 RAAT Output。
 
 ## 关于反向 SOOD 代理
 
@@ -346,4 +396,4 @@ Roon Beacon 只负责 Core 发现和转发，没法改变 Roon 的这个限制�
 
 ## 许可
 
-MIT
+GPL-3.0-only，见 `LICENSE`。第三方运行时组件保留各自许可证。

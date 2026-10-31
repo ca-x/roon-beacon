@@ -23,6 +23,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Node for the embedded React frontend
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build and verify the embedded frontend
+        run: |
+          npm --prefix web ci
+          npm --prefix web run check
+          npm --prefix web run build
+          git diff --exit-code -- crates/roon-beacon/src/web
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -37,8 +51,16 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Install audio test dependency
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Run tests
         run: cargo test --workspace --all-targets
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
 
   build:
     name: Build ${{ matrix.name }}
@@ -100,6 +122,7 @@ jobs:
           mkdir -p dist package
           cp "target/${TARGET}/release/${EXE}" package/
           cp README.md README.zh-CN.md LICENSE package/
+          cp web/THIRD_PARTY_NOTICES.md package/
 
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
             (cd package && 7z a -tzip "../dist/${ARCHIVE}" ./*)

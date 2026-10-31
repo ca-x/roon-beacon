@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f7f5f1">
+    <script>
+      (() => {
+        let preference = 'system';
+        try { preference = localStorage.getItem('roonBeaconTheme') || 'system'; } catch {}
+        const theme = preference === 'dark' || (preference !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.style.colorScheme = theme;
+        document.querySelector('meta[name="theme-color"]').content = theme === 'dark' ? '#191918' : '#f7f5f1';
+      })();
+    </script>
+    <meta name="description" content="Your Roon library, listening zones, and experimental browser audio in one remote.">
+    <title>Roon Beacon</title>
+    <link rel="icon" type="image/png" href="/favicon.png">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <script type="module" src="/src/main.tsx"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>JavaScript is required to control Roon. / 需要启用 JavaScript 才能控制 Roon。</noscript>
+  </body>
+</html>

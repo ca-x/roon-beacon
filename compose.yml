@@ -1,0 +1,15 @@
+services:
+  roon-beacon:
+    image: ghcr.io/${ROON_BEACON_IMAGE_OWNER:-ca-x}/roon-beacon:latest
+    build:
+      context: .
+    network_mode: host
+    environment:
+      ROON_BEACON_WEB_TOKEN: ${ROON_BEACON_WEB_TOKEN:-}
+    volumes:
+      - roon-beacon-data:/data
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+volumes:
+  roon-beacon-data:

@@ -284,13 +284,22 @@ fn process_response(
         }
     };
 
-    if msg.msg_type != SoodType::Response {
+    if msg.msg_type != SoodType::Response
+        || msg
+            .props
+            .get("service_id")
+            .and_then(|value| value.as_deref())
+            != Some(ROON_CORE_SERVICE_ID)
+    {
         return None;
     }
 
     let core_id = msg.props.get("unique_id")?.as_ref()?.clone();
     let http_port_str = msg.props.get("http_port")?.as_ref()?;
     let http_port: u16 = http_port_str.parse().ok()?;
+    if http_port == 0 {
+        return None;
+    }
     let name = msg.props.get("name").and_then(|v| v.clone());
     let display_version = msg.props.get("display_version").and_then(|v| v.clone());
 
@@ -314,6 +323,26 @@ fn process_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignores_non_core_announcements_and_zero_ports() {
+        for (service, port) in [("other-service", "9330"), (ROON_CORE_SERVICE_ID, "0")] {
+            let props = HashMap::from([
+                ("service_id".to_string(), Some(service.to_string())),
+                ("unique_id".to_string(), Some("not-a-core".to_string())),
+                ("http_port".to_string(), Some(port.to_string())),
+            ]);
+            let packet = crate::serialize_response(&props);
+            assert!(
+                process_response(
+                    &packet,
+                    "192.168.1.10:9003".parse().unwrap(),
+                    &HashSet::new()
+                )
+                .is_none()
+            );
+        }
+    }
 
     #[test]
     fn test_process_response_valid() {
@@ -353,6 +382,10 @@ mod tests {
     #[test]
     fn test_process_response_localhost_detection() {
         let mut props = HashMap::new();
+        props.insert(
+            "service_id".to_string(),
+            Some(ROON_CORE_SERVICE_ID.to_string()),
+        );
         props.insert("unique_id".to_string(), Some("local-core".to_string()));
         props.insert("http_port".to_string(), Some("9330".to_string()));
 
