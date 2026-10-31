@@ -56,6 +56,7 @@ export function BrowserAudio({ status, locked, statusError }: { status?: AudioSt
   else if (!status.enabled || status.state === 'disabled') message = text('audioDisabled');
   else if (!supported) message = text('audioFormat');
   else if (!status.available || status.state === 'error') message = text('audioUnavailable');
+  else if (joined && status.state === 'waiting') message = text('audioJoinedWaiting', { name: status.name || 'Beacon' });
   else if (joined) message = text(phase, { name: status.name || 'Beacon' });
   else if (status.state === 'starting') message = text('audioStarting');
   else message = text(status.state === 'streaming' ? 'audioStreaming' : 'audioWaiting', { name: status.name || 'Beacon', count: status.listeners || 0 });
@@ -69,6 +70,11 @@ export function BrowserAudio({ status, locked, statusError }: { status?: AudioSt
       setLoudness(audio.current.volume);
     }} /><output id="browserVolumeValue" htmlFor="browserVolume">{Math.round(loudness * 100)}%</output></div><p className="small-note">{text('browserVolumeHint')}</p></div>
     <Notice id="audioError" error={error || status?.error || statusError} />
+    {status?.enabled && status.pcm_bytes_received !== undefined && <details className="audio-diagnostics"><summary>{text('audioDiagnostics')}</summary>
+      <p className="small-note">{text('audioByteCounts', { pcm: status.pcm_bytes_received, mp3: status.bytes_streamed || 0 })}</p>
+      {status.receiver_diagnostics && <pre>{status.receiver_diagnostics}</pre>}
+      {status.encoder_diagnostics && <pre>{status.encoder_diagnostics}</pre>}
+    </details>}
     <audio id="browserAudio" ref={audio} preload="none" onPlaying={() => { if (joinedRef.current) setPhase('audioJoined'); }} onWaiting={() => { if (joinedRef.current) setPhase('audioBuffering'); }}
       onError={() => { if (joinedRef.current) { leave(); setError(text('audioFailed')); } }} onEnded={() => { if (joinedRef.current) { leave(); setError(text('audioEnded')); } }} />
   </section>;

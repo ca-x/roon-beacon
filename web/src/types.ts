@@ -107,6 +107,15 @@ export interface AudioStatus {
   name?: string;
   listeners?: number;
   error?: string | null;
+  pcm_bytes_received?: number;
+  bytes_streamed?: number;
+  receiver_diagnostics?: string | null;
+  encoder_diagnostics?: string | null;
+}
+
+export interface AudioNetwork {
+  interface: string | null;
+  interfaces: { name: string; addresses: string[] }[];
 }
 
 export interface Auth {

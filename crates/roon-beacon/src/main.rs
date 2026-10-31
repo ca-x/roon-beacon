@@ -4,6 +4,7 @@
 //! beacon plus TCP forwarding endpoint.
 
 mod audio;
+mod audio_network;
 mod auth;
 mod persistence;
 mod player;

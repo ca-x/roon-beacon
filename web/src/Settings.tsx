@@ -3,6 +3,7 @@ import { SlidersHorizontal } from 'lucide-react';
 import { Button, Notice, TextField, useText } from './ui';
 import { clockTime, errorMessage, request } from './api';
 import type { RuntimeConfig, Status } from './types';
+import { AudioNetworkSettings } from './AudioNetworkSettings';
 
 export function Settings({ status, statusError, locked, refresh }: { status?: Status; statusError?: string; locked: boolean; refresh: () => Promise<unknown> }) {
   const text = useText();
@@ -47,6 +48,7 @@ export function Settings({ status, statusError, locked, refresh }: { status?: St
           <div className="inline-actions"><Button id="configSave" className="secondary" type="submit" disabled={saving || locked}>{text('save')}</Button><span id="feedback" className="small-note" role="status">{feedback}</span></div>
           <Notice id="configError" error={error} />
         </form>
+        <AudioNetworkSettings locked={locked} refresh={refresh} />
       </div>
     </details>
     <footer><span>{text('footer')}</span><span><span id="version">{status?.version ? `v${status.version}` : ''}</span>{text('uptime')} <span id="uptime">{status ? clockTime(status.uptime_secs) : '—'}</span></span></footer>

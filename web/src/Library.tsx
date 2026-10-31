@@ -3,6 +3,7 @@ import { ArrowLeft, ChevronLeft, ChevronRight, Home, LibraryBig, Music2, Play, R
 import { Button, Notice, TextField, useText } from './ui';
 import { errorMessage, request } from './api';
 import type { BrowseItem, BrowseOptions, BrowseResult } from './types';
+import { browseLabel, navigationKey, type BrowseView } from './browse-i18n';
 
 const pageSize = 40;
 
@@ -17,6 +18,8 @@ export function LibraryPanel({ ready, zoneId, session }: { ready: boolean; zoneI
   const text = useText();
   const [hierarchy, setHierarchy] = useState<'browse' | 'search'>('browse');
   const [result, setResult] = useState<BrowseResult | null>(null);
+  const [view, setView] = useState<BrowseView>({ navigation: false });
+  const viewHistory = useRef(new Map<number, BrowseView>());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -56,6 +59,19 @@ export function LibraryPanel({ ready, zoneId, session }: { ready: boolean; zoneI
       setPrompt(null);
       setInput('');
       if (data.list) {
+        let nextView = viewHistory.current.get(data.list.level) || { navigation: false };
+        if (options.pop_all) {
+          viewHistory.current.clear();
+          nextView = { navigation: true, titleKey: navigationKey(data.list.title) };
+        } else if (options.input !== undefined) {
+          nextView = { navigation: false, titleKey: data.list.title === 'Search results' ? 'searchResults' : undefined };
+        } else if (options.item_key) {
+          const selected = result?.items.find((item) => item.item_key === options.item_key);
+          const titleKey = view.navigation && selected && !selected.image_key && !selected.subtitle ? navigationKey(selected.title) : undefined;
+          nextView = { navigation: titleKey === 'roonLibrary', titleKey: selected?.title === data.list.title ? titleKey : undefined };
+        }
+        viewHistory.current.set(data.list.level, nextView);
+        setView(nextView);
         setResult({ ...data, items: Array.isArray(data.items) ? data.items : [], offset: data.offset ?? data.list.display_offset ?? 0 });
         if (userInitiated) requestAnimationFrame(() => titleRef.current?.focus({ preventScroll: true }));
       }
@@ -103,20 +119,20 @@ export function LibraryPanel({ ready, zoneId, session }: { ready: boolean; zoneI
       <div className="browse-navigation">
         <Button id="browseBack" className="icon-button" aria-label={text('back')} disabled={unavailable || !result?.list?.level} onClick={() => browse({ pop_levels: 1 }, true)}><ArrowLeft aria-hidden="true" /></Button>
         <Button id="browseRoot" className="icon-button" aria-label={text('root')} disabled={unavailable} onClick={() => browse({ pop_all: true }, true)}><Home aria-hidden="true" /></Button>
-        <h2 id="browseTitle" ref={titleRef} tabIndex={-1}>{result?.list?.title || text(hierarchy)}</h2>
+        <h2 id="browseTitle" ref={titleRef} tabIndex={-1}>{view.titleKey ? text(view.titleKey) : result?.list?.title || text(hierarchy)}</h2>
       </div>
       <p id="browseStatus" className="small-note" role="status">{busy ? text('loading') : notice || (result ? text('items', { count }) : text('loadLibrary'))}</p>
       <Notice id="browseError" error={error} />
       <form id="promptForm" className="prompt-form" hidden={!prompt} onSubmit={(event) => { event.preventDefault(); if (prompt) void browse({ item_key: prompt.item_key, input }, true); }}>
-        <TextField id="browseInput" ref={inputRef} variant="outline" label={prompt?.input_prompt?.prompt || prompt?.title || text('search')}
+        <TextField id="browseInput" ref={inputRef} variant="outline" label={browseLabel(prompt?.input_prompt?.prompt || prompt?.title, 'prompt', text) || text('search')}
           type={prompt?.input_prompt?.is_password ? 'password' : 'search'} autoComplete="off" maxLength={2000} aria-describedby="browseError"
           value={input} onChange={(event) => setInput(event.target.value)} />
-        <div className="inline-actions"><Button id="promptSubmit" className="primary" type="submit" disabled={unavailable}>{prompt?.input_prompt?.action || text('continue')}</Button><Button id="promptCancel" className="text-button" onClick={() => { setPrompt(null); setInput(''); titleRef.current?.focus(); }}>{text('cancel')}</Button></div>
+        <div className="inline-actions"><Button id="promptSubmit" className="primary" type="submit" disabled={unavailable}>{browseLabel(prompt?.input_prompt?.action, 'prompt', text) || text('continue')}</Button><Button id="promptCancel" className="text-button" onClick={() => { setPrompt(null); setInput(''); titleRef.current?.focus(); }}>{text('cancel')}</Button></div>
       </form>
       <ul id="browseItems" className="browse-items">
         {items.map((item, index) => <li key={`${item.item_key || item.title}:${index}`}><Button className={`browse-row${['action', 'action_list'].includes(item.hint || '') ? ' action-row' : ''}`}
           disabled={unavailable || !item.item_key} onClick={() => item.input_prompt ? openPrompt(item) : browse({ item_key: item.item_key }, true)}>
-          <ItemArtwork item={item} /><span className="item-copy"><span className="item-title">{item.title}</span>{item.subtitle && <span className="item-subtitle">{item.subtitle}</span>}</span><ChevronRight className="row-chevron" aria-hidden="true" />
+          <ItemArtwork item={item} /><span className="item-copy"><span className="item-title">{item.hint === 'action' ? browseLabel(item.title, 'action', text) : item.input_prompt ? browseLabel(item.title, 'prompt', text) : view.navigation && !item.image_key && !item.subtitle ? browseLabel(item.title, 'navigation', text) : item.title}</span>{item.subtitle && <span className="item-subtitle">{item.subtitle}</span>}</span><ChevronRight className="row-chevron" aria-hidden="true" />
         </Button></li>)}
       </ul>
       <p id="browseEmpty" className="empty-list" hidden={!result || busy || items.length > 0}>{text('emptyList')}</p>

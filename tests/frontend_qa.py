@@ -116,12 +116,44 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/audio/status":
             disabled = FIXTURE["scenario"] in {"empty", "authorization"}
             return self.reply({"enabled": not disabled, "available": not disabled, "state": "disabled" if disabled else "waiting",
-                               "name": "Fixture Beacon", "listeners": 0, "bytes_streamed": 0, "error": None})
+                               "name": "Fixture Beacon", "listeners": 0, "bytes_streamed": 0, "pcm_bytes_received": 0,
+                               "receiver_diagnostics": "<script>fixture diagnostic</script>", "encoder_diagnostics": None, "error": None})
+        if path == "/api/audio/network":
+            if self.command == "POST":
+                if FIXTURE.get("network_save_error"):
+                    return self.reply({"error": "Fixture network save failed"}, 500)
+                FIXTURE["audio_interface"] = body["interface"]
+                return self.reply({"ok": True})
+            return self.reply({"interface": FIXTURE.get("audio_interface"), "interfaces": [
+                {"name": "eth0", "addresses": ["192.0.2.10", "2001:db8::10"]},
+                {"name": "wlan0", "addresses": ["192.0.2.11"]}]})
         if path.startswith("/api/player/image/"):
             return self.reply({"error": "Cover unavailable in fixture"}, 404)
         if path == "/api/player/browse":
             assert 0 < body["count"] <= 100
             assert body["session"] and len(body["session"]) <= 128
+            if FIXTURE.get("navigation_fixture"):
+                title, level = "Library", 1
+                items = [{"title": "Search", "item_key": "nav-search", "input_prompt": {"prompt": "Search", "action": "Go"}}]
+                items += [{"title": label, "item_key": "nav-" + label.lower(), "hint": "list"}
+                          for label in ("Artists", "Albums", "Tracks", "Composers", "Tags")]
+                if body.get("item_key") == "nav-artists":
+                    title, level = "Artists", 2
+                    items = [{"title": label, "item_key": "artist-" + label.lower(), "hint": "list"}
+                             for label in ("Library", "Search", "Artists")]
+                elif body.get("item_key") == "artist-library":
+                    title, level = "Library", 3
+                    items = [{"title": "Search", "item_key": "song-search", "hint": "action_list"}]
+                elif body.get("item_key") == "song-search":
+                    title, level = "Search", 4
+                    items = [{"title": label, "item_key": "action-" + label.lower(), "hint": "action"}
+                             for label in ("Play Now", "Add Next", "Queue")]
+                elif "input" in body:
+                    title, level = "Search results", 2
+                    items = [{"title": label, "item_key": "artist-" + label.lower(), "hint": "list"}
+                             for label in ("Library", "Search", "Artists")]
+                return self.reply({"action": "list", "list": {"title": title, "count": len(items), "level": level},
+                                   "items": items, "offset": 0})
             if body.get("item_key") == "fail":
                 return self.reply({"error": "Fixture browse failure"}, 502)
             if body.get("item_key") == "play-now":
@@ -171,7 +203,11 @@ def main():
     parser.add_argument("--browser", default=str(candidates[-1]) if candidates else "agent-browser")
     parser.add_argument("--screenshots", default="/tmp/roon-beacon-react-qa")
     parser.add_argument("--skip-pointer-context", action="store_true", help="Skip slow context-poll loops while iterating unrelated assertions")
+    parser.add_argument("--localization-only", action="store_true", help="Run focused Roon navigation, prompt, action and metadata localization regressions")
+    parser.add_argument("--appearance-only", action="store_true", help="Check full theme labels at narrow widths and enlarged font sizes")
+    parser.add_argument("--audio-network-only", action="store_true", help="Check audio network editing, persistence, errors and waiting feedback")
     arguments = parser.parse_args()
+    FIXTURE["navigation_fixture"] = arguments.localization_only
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     origin = f"http://127.0.0.1:{server.server_port}"
@@ -216,9 +252,118 @@ def main():
         assert findings["success"] and findings["data"]["counts"]["violations"] == 0, raw
         assert findings["data"]["counts"]["incomplete"] == 0, raw
 
+    def audio_network_regressions():
+        browser("click", "[data-lang=zh]")
+        browser("click", "#settings summary")
+        browser("wait", "--fn", "Boolean(document.querySelector('#audioNetworkSelect option[value=eth0]'))")
+        evaluate("assert(document.querySelector('#audioNetworkHeading').textContent === '浏览器音频网络', 'Localized audio network heading'); assert(document.querySelector('#audioNetworkSelect option[value=eth0]').textContent.includes('192.0.2.10'), 'LAN address visible beside interface');")
+        browser("select", "#audioNetworkSelect", "wlan0")
+        FIXTURE["audio_interface"] = "eth0"
+        poll("/api/audio/network")
+        evaluate("assert(document.querySelector('#audioNetworkSelect').value === 'wlan0', 'Polling never overwrites unsaved selection');")
+        FIXTURE["network_save_error"] = True
+        browser("click", "#audioNetworkSave")
+        browser("wait", "#audioNetworkError")
+        evaluate("assert(document.querySelector('#audioNetworkError').textContent.includes('Fixture network save failed') && document.querySelector('#audioNetworkSelect').value === 'wlan0', 'Save failure retains selection and shows error');")
+        FIXTURE["network_save_error"] = False
+        browser("click", "#audioNetworkSave")
+        browser("wait", "--fn", "document.querySelector('#audioNetworkFeedback').textContent.includes('已保存')")
+        assert [item for item in requests_to("/api/audio/network") if item["method"] == "POST"][-1]["body"] == {"interface": "wlan0"}
+        browser("reload")
+        browser("wait", "#browseItems button")
+        browser("click", "#settings summary")
+        browser("wait", "--fn", "document.querySelector('#audioNetworkSelect').value === 'wlan0'")
+        FIXTURE["audio_interface"] = "removed-interface"
+        poll("/api/audio/network")
+        evaluate("assert(document.querySelector('#audioNetworkSelect').value === 'removed-interface' && document.querySelector('#audioNetworkSave').disabled, 'Missing saved interface remains visible and recoverable');")
+        browser("select", "#audioNetworkSelect", "")
+        browser("click", "#audioNetworkSave")
+        browser("wait", "--fn", "document.querySelector('#audioNetworkFeedback').textContent.includes('已保存')")
+        assert any(item["method"] == "POST" and item["body"] == {"interface": None} for item in requests_to("/api/audio/network"))
+        browser("set", "viewport", "375", "812")
+        evaluate("assert(document.documentElement.scrollWidth <= innerWidth, 'Audio network settings fit mobile'); const audio = document.querySelector('#browserAudio'); audio.play = () => new Promise(() => {});")
+        browser("click", "#audioJoin")
+        evaluate("assert(document.querySelector('#audioStatus').textContent.includes('尚未收到音频'), 'Waiting receiver is not misrepresented as browser buffering'); assert(document.querySelector('.audio-diagnostics pre').textContent === '<script>fixture diagnostic</script>', 'Receiver diagnostic text is escaped');")
+        browser("screenshot", "--full", str(screenshots / "audio-network-375-zh.png"))
+        browser("click", "#audioLeave")
+        evaluate("delete document.querySelector('#browserAudio').play;")
+        browser("click", "[data-lang=en]")
+        evaluate("assert(document.querySelector('#audioNetworkHeading').textContent === 'Browser audio network', 'Audio network language switches immediately');")
+        browser("click", "#settings summary")
+
     try:
         browser("open", origin)
         browser("wait", "#browseItems button")
+        if arguments.appearance_only:
+            for width in (320, 375, 768, 1440):
+                browser("set", "viewport", str(width), "900")
+                for language in ("zh", "en"):
+                    browser("click", f"[data-lang={language}]")
+                    for font_size in (16, 20, 24, 32):
+                        evaluate(f"document.documentElement.style.fontSize = '{font_size}px';")
+                        for theme in ("light", "dark", "system"):
+                            browser("select", "#themeSelect", theme)
+                            evaluate("""
+                                const select = document.querySelector('#themeSelect');
+                                const style = getComputedStyle(select);
+                                const context = document.createElement('canvas').getContext('2d');
+                                context.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+                                const labelWidth = context.measureText(select.selectedOptions[0].textContent).width;
+                                const available = select.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+                                assert(labelWidth <= available, `Full theme label fits: ${select.selectedOptions[0].textContent}, text=${labelWidth}, available=${available}`);
+                                const control = select.getBoundingClientRect();
+                                const brand = document.querySelector('.brand').getBoundingClientRect();
+                                assert(control.left >= 0 && control.right <= innerWidth, 'Theme control stays inside viewport');
+                                assert(control.left >= brand.right || control.top >= brand.bottom, 'Theme control never overlaps logo');
+                                assert(document.querySelector('.masthead').getBoundingClientRect().right <= innerWidth, 'Header fits viewport');
+                            """)
+                    browser("screenshot", str(screenshots / f"appearance-{width}-{language}-200pct.png"))
+                    evaluate("document.documentElement.style.fontSize = '';")
+            print(f"PASS: full EN/ZH theme labels and header layout at 320/375/768/1440px, 100/125/150/200% font sizes. Screenshots: {screenshots}", flush=True)
+            return
+        if not arguments.localization_only:
+            audio_network_regressions()
+            if arguments.audio_network_only:
+                print("PASS: audio network addresses, dirty selection across polling, failure retention, save/reload, missing-interface recovery, automatic mode, waiting feedback and escaped diagnostics; mobile375.", flush=True)
+                return
+            FIXTURE["requests"].clear()
+        if arguments.localization_only:
+            browser("click", "[data-lang=zh]")
+            evaluate("assert(document.querySelector('#browseTitle').textContent === '音乐库', 'Roon Library heading localized'); assert(Array.from(document.querySelectorAll('#browseItems .item-title'), item => item.textContent).join(',') === '搜索,艺人,专辑,曲目,作曲家,标签', 'All six Roon navigation labels localized');")
+            browser("click", "#browseItems li:first-child button")
+            evaluate("assert(document.querySelector('label[for=browseInput]').textContent === '搜索' && document.querySelector('#promptSubmit').textContent === '确定', 'Roon Search prompt and Go localized');")
+            browser("fill", "#browseInput", "Library")
+            browser("click", "[data-lang=en]")
+            evaluate("assert(document.querySelector('#browseInput').value === 'Library' && document.querySelector('#promptSubmit').textContent === 'Go', 'Language switch preserves search input and restores Roon verb');")
+            browser("click", "[data-lang=zh]")
+            browser("click", "#promptSubmit")
+            browser("wait", "--fn", "document.querySelector('#browseTitle').textContent === '搜索结果'")
+            evaluate("assert(Array.from(document.querySelectorAll('#browseItems .item-title'), item => item.textContent).join(',') === 'Library,Search,Artists', 'Search-result music metadata is never translated');")
+            browser("click", "#browseRoot")
+            browser("wait", "--fn", "document.querySelectorAll('#browseItems button').length === 6")
+            browser("click", "#browseItems li:nth-child(2) button")
+            browser("wait", "--fn", "document.querySelector('#browseTitle').textContent === '艺人'")
+            evaluate("assert(Array.from(document.querySelectorAll('#browseItems .item-title'), item => item.textContent).join(',') === 'Library,Search,Artists', 'Artist names matching navigation labels remain original');")
+            browser("click", "#browseBack")
+            browser("wait", "--fn", "document.querySelector('#browseTitle').textContent === '音乐库'")
+            evaluate("assert(document.querySelector('#browseItems li:nth-child(2) .item-title').textContent === '艺人', 'Back restores localized navigation context');")
+            browser("click", "#browseItems li:nth-child(2) button")
+            browser("wait", "--fn", "document.querySelector('#browseTitle').textContent === '艺人'")
+            browser("click", "#browseItems li:first-child button")
+            browser("wait", "--fn", "document.querySelector('#browseTitle').textContent === 'Library'")
+            evaluate("assert(document.querySelector('#browseItems .item-title').textContent === 'Search', 'Album and song titles remain original');")
+            browser("click", "#browseItems button")
+            browser("wait", "--fn", "document.querySelectorAll('#browseItems button').length === 3")
+            evaluate("assert(document.querySelector('#browseTitle').textContent === 'Search', 'Song title remains original in action list'); assert(Array.from(document.querySelectorAll('#browseItems .item-title'), item => item.textContent).join(',') === '立即播放,下一首播放,加入队列', 'Roon action verbs localized');")
+            browser("click", "#browseRoot")
+            browser("wait", "--fn", "document.querySelectorAll('#browseItems button').length === 6")
+            browser("set", "viewport", "375", "812")
+            evaluate("assert(document.documentElement.scrollWidth <= innerWidth, 'Localized navigation fits mobile');")
+            browser("screenshot", "--full", str(screenshots / "localized-navigation-375.png"))
+            browser("click", "[data-lang=en]")
+            evaluate("assert(document.querySelector('#browseTitle').textContent === 'Library' && document.querySelector('#browseItems li:nth-child(2) .item-title').textContent === 'Artists', 'Switching to English restores original navigation');")
+            print("PASS: Roon navigation, prompts, actions, language switching, back navigation and original music metadata; mobile375.", flush=True)
+            return
         evaluate("assert(crypto.randomUUID === undefined, 'LAN-insecure UUID fallback exercised'); assert(document.querySelector('#trackTitle').textContent === 'A quiet afternoon', 'Playing metadata'); assert(document.querySelector('#previous').disabled && !document.querySelector('#next').disabled, 'Transport capabilities'); assert(document.querySelectorAll('#volumeControls input:disabled').length === 2, 'Fixed and relative volume disabled'); assert(document.querySelectorAll('#volumeControls button:disabled').length === 2, 'Mute support'); const range = document.querySelector('#volumeControls input'); assert(range.min === '10' && range.max === '80' && range.step === '2', 'Volume bounds'); assert(!document.querySelector('#browserAudio').hasAttribute('src'), 'No autoplay'); assert(!document.querySelector('#browseItems img[src=x]'), 'Untrusted browse text is escaped'); window.qaSeek = document.querySelector('#seek'); window.qaVolume = range; window.qaOption = document.querySelector('#zoneSelect option');")
         for width, height in [(1440, 1000), (768, 1024), (375, 812)]:
             browser("set", "viewport", str(width), str(height))

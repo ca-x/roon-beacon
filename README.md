@@ -25,7 +25,7 @@ docker compose up -d
 docker compose exec roon-beacon cat /data/web-access-token
 ```
 
-Open `http://<docker-host-ip>:9339` and enter the generated token. The image is `ghcr.io/ca-x/roon-beacon:0.2.0`, with `linux/amd64` and `linux/arm64` support. `latest` tracks stable version tags; pin a version or digest for repeatable deployments. The container uses host networking for SOOD and AirPlay/mDNS discovery. Docker Desktop bridge networking is not an equivalent LAN multicast setup.
+Open `http://<docker-host-ip>:9339` and enter the generated token. The image is `ghcr.io/ca-x/roon-beacon:0.2.1`, with `linux/amd64` and `linux/arm64` support. `latest` tracks stable version tags; pin a version or digest for repeatable deployments. The container uses host networking for SOOD and AirPlay/mDNS discovery. Docker Desktop bridge networking is not an equivalent LAN multicast setup.
 
 The `/data` volume contains private authorization tokens and the selected Server. Keep it across container updates. Optionally set `ROON_BEACON_WEB_TOKEN` to a private 16–256-character token using ASCII letters, digits, `-`, `_`, or `.`. On a non-loopback Web bind, authentication is always enabled: a token is generated when none is configured. Do not expose this service directly to the Internet; use a trusted LAN, VPN, or HTTPS reverse proxy. Reverse proxies must preserve the browser-visible `Host` for same-origin checks.
 
@@ -50,6 +50,10 @@ Roon Server → AirPlay → Shairport Sync → PCM → FFmpeg MP3 → browser au
 This is an **experimental, shared AirPlay output**, not RAAT or a separate Roon zone per browser. MP3 encoding is lossy, buffering adds latency, and multiple browsers are not synchronized. Leaving a browser stream does not pause the shared Roon zone. The receiver must be discoverable and reachable by the Roon Server; the existing SOOD reverse proxy does not forward AirPlay/mDNS across a VPN. No host sound card or `/dev/snd` mount is needed.
 
 Audio availability and missing-runtime errors appear in the UI. Automated mock-Core and synthetic-audio tests do not replace acceptance testing with your actual Roon Server, network, and browser.
+
+On hosts with multiple network interfaces, open **Connection & runtime settings → Browser audio network** and select the LAN interface reachable by Roon. Each option lists the interface's addresses. **Automatic** restores the receiver's default interface selection. This setting is saved in `/data/audio-network.json` (or the configured data directory) and restarts only the audio receiver and encoder; it does not change Core discovery, the Web address, or phone playback controls. No deployment parameter or container recreation is needed. Re-select the Beacon output in Roon and join browser audio again after changing it. A saved interface that disappears produces an audio error while the Web settings remain available for recovery.
+
+The browser-facing HTTPS domain is not the address Roon uses to send AirPlay audio. If the browser is connected but waiting for audio, inspect **Audio diagnostics**: `pcm_bytes_received` counts receiver PCM input, while `bytes_streamed` counts encoded MP3 output, both since process startup. Bounded receiver/encoder stderr is available here and in the authenticated `/api/audio/status` response. Zero MP3 bytes alone do not identify the failing stage. If the Beacon zone immediately stops, check Roon's playback error as well as receiver diagnostics; a working phone remote does not prove the AirPlay path works.
 
 ### New Options
 
@@ -183,6 +187,8 @@ If probing fails, verify that the remote Core is running and UDP `9003` is reach
 If playback is unstable, inspect the actual RAATServer-to-Core TCP path. Control-plane bridging cannot fix packet loss, reordering, or bandwidth limits on the audio stream itself.
 
 ## Releases
+
+Run `npm --prefix web run check`, `npm --prefix web run build`, and `cargo test --locked --workspace --all-targets` for the core checks. Browser contract tests use `python3 tests/frontend_qa.py` with the `agent-browser` CLI installed; focused `--localization-only`, `--appearance-only`, and `--audio-network-only` modes cover Roon translations, complete theme labels at 320–1440px / 100–200% font sizes, and persistent audio-network settings.
 
 GitHub Actions builds release-ready binaries for Linux, macOS, and Windows. Tagged releases upload archives with the compiled `roon-beacon` executable.
 

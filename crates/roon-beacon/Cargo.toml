@@ -1,6 +1,6 @@
 [package]
 name = "roon-beacon"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Roon discovery bridge, Web remote, and experimental browser audio gateway"
 license = "GPL-3.0-only"
@@ -28,6 +28,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 subtle = "2"
 getrandom = "0.3"
+if-addrs = "0.15"
 
 [dev-dependencies]
 tempfile = "3"

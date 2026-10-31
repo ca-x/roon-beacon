@@ -78,7 +78,7 @@ p { overflow-wrap: anywhere; }
 .skip-link { position: fixed; top: .75rem; left: .75rem; z-index: 20; padding: .75rem 1rem; border-radius: 8px; background: var(--text); color: var(--surface); transform: translateY(-200%); }
 .skip-link:focus { transform: none; }
 .shell { width: min(1256px, calc(100% - 96px)); margin: auto; padding-bottom: env(safe-area-inset-bottom, 0px); }
-.masthead { display: flex; align-items: center; justify-content: space-between; gap: 1rem; min-height: 112px; border-bottom: 1px solid var(--line); }
+.masthead { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; min-height: 112px; padding-block: 1rem; border-bottom: 1px solid var(--line); }
 .brand { display: flex; align-items: center; gap: .875rem; color: var(--text); text-decoration: none; font-size: 1.35rem; letter-spacing: -.04em; line-height: 1.25; }
 .brand strong { font-weight: 650; }
 .brand-icon { width: 34px; height: 34px; color: var(--accent); stroke-width: 1.5; }
@@ -88,7 +88,8 @@ p { overflow-wrap: anywhere; }
 .language { display: flex; padding: 3px; border: 1px solid var(--line); border-radius: 9px; }
 .language button { min-width: 48px; min-height: 38px; padding: .375rem .625rem; font-size: .75rem; color: var(--muted); }
 .language button[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px #2b292610; }
-.theme-choice select { min-height: 38px; width: 100px; padding: .375rem 1.5rem .375rem .5rem; font-size: .75rem; border-color: var(--line); }
+.theme-choice { flex: none; }
+.theme-choice select { min-height: 38px; width: auto; min-width: calc(6em + 2rem); padding: .375rem 1.5rem .375rem .5rem; font-size: .75rem; border-color: var(--line); }
 .connection-bar { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 1.5rem; align-items: center; padding: 1.5rem 0; border-bottom: 1px solid var(--line); }
 .selector { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: .75rem; min-width: 0; }
 .selector > span { color: var(--muted); font-size: .75rem; }
@@ -187,6 +188,11 @@ input[type="range"]:disabled { accent-color: var(--control-line); cursor: not-al
 .settings-meta { color: var(--muted); font-size: .75rem; margin-left: auto; }
 .settings-body { display: grid; grid-template-columns: 1fr 1fr; gap: 3rem; padding: .5rem 0 2rem; }
 .settings-body h2 { margin-bottom: 1.25rem; }
+.audio-network-settings { grid-column: 1 / -1; display: grid; gap: 1rem; min-width: 0; border-top: 1px solid var(--line); padding-top: 1.5rem; }
+.audio-network-settings h2 { margin-bottom: 0; }
+.audio-network-settings .field { max-width: 38rem; }
+.audio-diagnostics { margin-top: 1rem; font-size: .75rem; }
+.audio-diagnostics pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
 .signal-path { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; margin: 0; }
 dt { font-size: .75rem; color: var(--muted); }
 dd { margin: .25rem 0 0; overflow-wrap: anywhere; font-size: .875rem; }

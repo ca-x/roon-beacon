@@ -10,6 +10,8 @@ use axum::{
 use bytes::Bytes;
 use futures_util::stream;
 use serde::Serialize;
+
+use crate::audio_network::{AudioNetwork, NetworkSelection, NetworkSettings};
 use std::{
     io,
     path::PathBuf,
@@ -21,7 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::{Child, Command},
     sync::{broadcast, watch, OwnedSemaphorePermit, Semaphore},
 };
@@ -85,6 +87,7 @@ pub struct AudioGateway {
 #[derive(Debug)]
 struct GatewayInner {
     shared: Arc<Shared>,
+    network: Arc<AudioNetwork>,
     stop: watch::Sender<bool>,
     stopped: watch::Receiver<bool>,
 }
@@ -100,6 +103,7 @@ struct Shared {
     runtime: Mutex<Runtime>,
     listeners: Arc<Semaphore>,
     bytes_streamed: AtomicU64,
+    pcm_bytes_received: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -117,6 +121,9 @@ struct AudioStatus {
     name: String,
     listeners: usize,
     bytes_streamed: u64,
+    pcm_bytes_received: u64,
+    receiver_diagnostics: Option<String>,
+    encoder_diagnostics: Option<String>,
     error: Option<String>,
 }
 
@@ -128,6 +135,12 @@ enum AudioState {
     Waiting,
     Streaming,
     Error,
+}
+
+#[derive(PartialEq, Eq)]
+enum PipelineExit {
+    Stopped,
+    Reconfigure,
 }
 
 impl Shared {
@@ -149,6 +162,7 @@ impl Shared {
         }
         status.listeners = MAX_LISTENERS - self.listeners.available_permits();
         status.bytes_streamed = self.bytes_streamed.load(Ordering::Relaxed);
+        status.pcm_bytes_received = self.pcm_bytes_received.load(Ordering::Relaxed);
         status
     }
 }
@@ -185,6 +199,9 @@ impl AudioGateway {
                     name,
                     listeners: 0,
                     bytes_streamed: 0,
+                    pcm_bytes_received: 0,
+                    receiver_diagnostics: None,
+                    encoder_diagnostics: None,
                     error: None,
                 },
                 audio: None,
@@ -192,19 +209,23 @@ impl AudioGateway {
             }),
             listeners: Arc::new(Semaphore::new(MAX_LISTENERS)),
             bytes_streamed: AtomicU64::new(0),
+            pcm_bytes_received: AtomicU64::new(0),
         });
+        let network = Arc::new(AudioNetwork::load(&data_dir)?);
         let (stop, stop_receiver) = watch::channel(false);
         let (stopped_sender, stopped) = watch::channel(!enabled);
         if enabled {
             let shared = shared.clone();
+            let network = network.subscribe();
             tokio::spawn(async move {
-                supervise(shared, stop_receiver, data_dir, receiver, encoder).await;
+                supervise(shared, stop_receiver, network, data_dir, receiver, encoder).await;
                 stopped_sender.send_replace(true);
             });
         }
         Ok(Self {
             inner: Arc::new(GatewayInner {
                 shared,
+                network,
                 stop,
                 stopped,
             }),
@@ -215,6 +236,10 @@ impl AudioGateway {
         Router::new()
             .route("/api/audio/status", get(audio_status))
             .route("/api/audio/stream", get(audio_stream))
+            .route(
+                "/api/audio/network",
+                get(audio_network).post(save_audio_network),
+            )
             .with_state(self.clone())
     }
 
@@ -227,6 +252,41 @@ impl AudioGateway {
 
 async fn audio_status(State(gateway): State<AudioGateway>) -> Json<AudioStatus> {
     Json(gateway.inner.shared.status())
+}
+
+async fn audio_network(
+    State(gateway): State<AudioGateway>,
+) -> Result<Json<NetworkSettings>, (StatusCode, Json<serde_json::Value>)> {
+    gateway.inner.network.settings().map(Json).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+    })
+}
+
+async fn save_audio_network(
+    State(gateway): State<AudioGateway>,
+    Json(selection): Json<NetworkSelection>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    selection.validate().map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+    })?;
+    gateway
+        .inner
+        .network
+        .save(selection)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+        })?;
+    Ok(Json(serde_json::json!({"ok": true})))
 }
 
 struct Listener {
@@ -282,20 +342,37 @@ async fn audio_stream(State(gateway): State<AudioGateway>) -> Response {
 async fn supervise(
     shared: Arc<Shared>,
     mut stop: watch::Receiver<bool>,
+    mut network: watch::Receiver<NetworkSelection>,
     data_dir: PathBuf,
     receiver: PathBuf,
     encoder: PathBuf,
 ) {
     while !*stop.borrow() {
+        let selection = network.borrow_and_update().clone();
         {
             let mut runtime = shared.runtime();
             runtime.status.state = AudioState::Starting;
             runtime.status.available = false;
             runtime.status.error = None;
+            runtime.status.receiver_diagnostics = None;
+            runtime.status.encoder_diagnostics = None;
         }
-        let result = run_pipeline(&shared, &mut stop, &data_dir, &receiver, &encoder).await;
+        let result = run_pipeline(
+            &shared,
+            &mut stop,
+            &mut network,
+            &selection,
+            &data_dir,
+            &receiver,
+            &encoder,
+        )
+        .await;
         if *stop.borrow() {
             break;
+        }
+        if matches!(result, Ok(PipelineExit::Reconfigure)) || network.has_changed().unwrap_or(false)
+        {
+            continue;
         }
         {
             let mut runtime = shared.runtime();
@@ -303,12 +380,13 @@ async fn supervise(
             runtime.status.available = false;
             runtime.status.state = AudioState::Error;
             runtime.status.error = Some(match result {
-                Ok(()) => "audio pipeline stopped unexpectedly".to_owned(),
+                Ok(_) => "audio pipeline stopped unexpectedly".to_owned(),
                 Err(error) => format!("{error:#}"),
             });
         }
         tokio::select! {
             _ = stop.changed() => break,
+            _ = network.changed() => {},
             _ = tokio::time::sleep(RETRY_DELAY) => {},
         }
     }
@@ -323,10 +401,12 @@ async fn supervise(
 async fn run_pipeline(
     shared: &Shared,
     stop: &mut watch::Receiver<bool>,
+    network: &mut watch::Receiver<NetworkSelection>,
+    selection: &NetworkSelection,
     data_dir: &std::path::Path,
     receiver_program: &std::path::Path,
     encoder_program: &std::path::Path,
-) -> Result<()> {
+) -> Result<PipelineExit> {
     if !cfg!(target_endian = "little") {
         bail!("the Shairport stdout gateway requires a little-endian host");
     }
@@ -335,11 +415,11 @@ async fn run_pipeline(
         .await
         .context("creating audio configuration directory")?;
     let config_path = config_dir.join("shairport-sync.conf");
-    tokio::fs::write(&config_path, RECEIVER_CONFIG)
+    tokio::fs::write(&config_path, selection.receiver_config(RECEIVER_CONFIG)?)
         .await
         .context("writing audio receiver configuration")?;
     if *stop.borrow() {
-        return Ok(());
+        return Ok(PipelineExit::Stopped);
     }
     let mut encoder = Command::new(encoder_program)
         .args(ENCODER_ARGS)
@@ -368,7 +448,7 @@ async fn run_pipeline(
             });
         }
     };
-    let result = transfer_audio(shared, stop, &mut receiver, &mut encoder).await;
+    let result = transfer_audio(shared, stop, network, &mut receiver, &mut encoder).await;
     {
         let mut runtime = shared.runtime();
         runtime.audio = None;
@@ -386,9 +466,10 @@ async fn terminate(child: &mut Child) {
 async fn transfer_audio(
     shared: &Shared,
     stop: &mut watch::Receiver<bool>,
+    network: &mut watch::Receiver<NetworkSelection>,
     receiver: &mut Child,
     encoder: &mut Child,
-) -> Result<()> {
+) -> Result<PipelineExit> {
     let mut pcm = receiver.stdout.take().context("receiver stdout missing")?;
     let mut input = encoder.stdin.take().context("encoder stdin missing")?;
     let output = encoder.stdout.take().context("encoder stdout missing")?;
@@ -403,14 +484,19 @@ async fn transfer_audio(
         runtime.last_frame = None;
     }
     if *stop.borrow() {
-        return Ok(());
+        return Ok(PipelineExit::Stopped);
     }
-    let receiver_errors = capture_stderr(receiver_stderr);
-    let encoder_errors = capture_stderr(encoder_stderr);
+    let receiver_errors = capture_stderr(receiver_stderr, |message| {
+        shared.runtime().status.receiver_diagnostics = Some(message.to_owned());
+    });
+    let encoder_errors = capture_stderr(encoder_stderr, |message| {
+        shared.runtime().status.encoder_diagnostics = Some(message.to_owned());
+    });
     tokio::pin!(receiver_errors, encoder_errors);
     tokio::select! {
         biased;
-        _ = stop.changed() => Ok(()),
+        _ = stop.changed() => Ok(PipelineExit::Stopped),
+        _ = network.changed() => Ok(PipelineExit::Reconfigure),
         errors = &mut receiver_errors => bail!("AirPlay receiver exited: {}", errors?),
         errors = &mut encoder_errors => bail!("MP3 encoder exited: {}", errors?),
         status = receiver.wait() => {
@@ -421,7 +507,7 @@ async fn transfer_audio(
             let errors = encoder_errors.await?;
             bail!("MP3 encoder exited ({:?}): {errors}", status?);
         },
-        result = tokio::io::copy(&mut pcm, &mut input) => {
+        result = forward_pcm(&mut pcm, &mut input, shared) => {
             result.context("forwarding receiver PCM")?;
             bail!("AirPlay receiver PCM ended");
         },
@@ -432,7 +518,28 @@ async fn transfer_audio(
     }
 }
 
-async fn capture_stderr(mut stderr: impl AsyncRead + Unpin) -> io::Result<String> {
+async fn forward_pcm(
+    mut pcm: impl AsyncRead + Unpin,
+    mut input: impl AsyncWrite + Unpin,
+    shared: &Shared,
+) -> io::Result<()> {
+    let mut buffer = [0; 8192];
+    loop {
+        let count = pcm.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        shared
+            .pcm_bytes_received
+            .fetch_add(count as u64, Ordering::Relaxed);
+        input.write_all(&buffer[..count]).await?;
+    }
+}
+
+async fn capture_stderr(
+    mut stderr: impl AsyncRead + Unpin,
+    diagnostics: impl Fn(&str),
+) -> io::Result<String> {
     let mut retained = Vec::with_capacity(STDERR_LIMIT);
     let mut buffer = [0; 1024];
     loop {
@@ -443,6 +550,7 @@ async fn capture_stderr(mut stderr: impl AsyncRead + Unpin) -> io::Result<String
         let excess = (retained.len() + count).saturating_sub(STDERR_LIMIT);
         retained.drain(..excess);
         retained.extend_from_slice(&buffer[..count]);
+        diagnostics(String::from_utf8_lossy(&retained).trim());
     }
 }
 
@@ -531,7 +639,8 @@ mod tests {
             status(&gateway).await,
             serde_json::json!({
                 "enabled": false, "available": false, "state": "disabled",
-                "name": "Test output", "listeners": 0, "bytes_streamed": 0, "error": null
+                "name": "Test output", "listeners": 0, "bytes_streamed": 0, "error": null,
+                "pcm_bytes_received": 0, "receiver_diagnostics": null, "encoder_diagnostics": null
             })
         );
         assert!(!data_dir.exists());
@@ -619,9 +728,179 @@ mod tests {
     async fn stderr_retention_is_bounded() {
         let bytes = vec![b'x'; STDERR_LIMIT * 10];
         assert_eq!(
-            capture_stderr(bytes.as_slice()).await.unwrap().len(),
+            capture_stderr(bytes.as_slice(), |_| {})
+                .await
+                .unwrap()
+                .len(),
             STDERR_LIMIT
         );
+    }
+
+    #[tokio::test]
+    async fn audio_network_api_keeps_authentication_and_origin_checks() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = AudioGateway::start(false, "Test".to_owned(), directory.path().to_owned())
+            .await
+            .unwrap();
+        let token = "test-audio-network-token";
+        let auth = crate::auth::WebAuth::open(
+            "0.0.0.0:39339".parse().unwrap(),
+            directory.path(),
+            Some(token.to_owned()),
+        )
+        .unwrap();
+        let router = gateway.router().layer(axum::middleware::from_fn_with_state(
+            auth,
+            crate::auth::protect,
+        ));
+        for method in ["GET", "POST"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/api/audio/network")
+                        .header(header::HOST, "beacon.test")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"interface":null}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/audio/network")
+                    .header(header::HOST, "beacon.test")
+                    .header(header::ORIGIN, "https://attacker.test")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"interface":null}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        for (body, expected) in [
+            (
+                r#"{"interface":"beacon-missing-interface"}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (r#"{"interface":null}"#, StatusCode::OK),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post("/api/audio/network")
+                        .header(header::HOST, "beacon.test")
+                        .header(header::ORIGIN, "https://beacon.test")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        gateway.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn network_changes_reap_both_children_and_restart_without_retry_delay() {
+        let Some(interface) = crate::audio_network::interfaces()
+            .unwrap()
+            .into_iter()
+            .next()
+        else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI needs a network interface"
+            );
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let receiver_pid = directory.path().join("network-receiver.pid");
+        let encoder_pid = directory.path().join("network-encoder.pid");
+        let receiver = script(
+            directory.path(),
+            "receiver",
+            &format!("echo $$ > '{}'\nexec sleep 60", receiver_pid.display()),
+        );
+        let encoder = script(
+            directory.path(),
+            "encoder",
+            &format!("echo $$ > '{}'\nexec sleep 60", encoder_pid.display()),
+        );
+        std::fs::write(
+            directory.path().join("audio-network.json"),
+            br#"{"interface":"beacon-missing-interface"}"#,
+        )
+        .unwrap();
+        let gateway = AudioGateway::start_with_programs(
+            true,
+            "Network test".to_owned(),
+            directory.path().to_owned(),
+            receiver,
+            encoder,
+        )
+        .await
+        .unwrap();
+        wait_for_state(&gateway, AudioState::Error).await;
+        assert!(!receiver_pid.exists());
+        gateway
+            .inner
+            .network
+            .save(NetworkSelection {
+                interface: Some(interface.name.clone()),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_for_state(&gateway, AudioState::Waiting),
+        )
+        .await
+        .unwrap();
+        let first_receiver = std::fs::read_to_string(&receiver_pid).unwrap();
+        let first_encoder = std::fs::read_to_string(&encoder_pid).unwrap();
+        let config =
+            std::fs::read_to_string(directory.path().join("audio/shairport-sync.conf")).unwrap();
+        assert!(config.contains(&format!("interface = \"{}\";", interface.name)));
+        let mut stream = audio_stream(State(gateway.clone())).await.into_body();
+        gateway
+            .inner
+            .network
+            .save(NetworkSelection::default())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if std::fs::read_to_string(&receiver_pid).unwrap() != first_receiver
+                    && gateway.inner.shared.status().available
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!process_exists(&first_receiver));
+        assert!(!process_exists(&first_encoder));
+        assert!(stream.frame().await.is_none());
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("audio/shairport-sync.conf")).unwrap(),
+            RECEIVER_CONFIG
+        );
+        let last_receiver = std::fs::read_to_string(&receiver_pid).unwrap();
+        let last_encoder = std::fs::read_to_string(&encoder_pid).unwrap();
+        gateway.shutdown().await;
+        assert!(!process_exists(&last_receiver));
+        assert!(!process_exists(&last_encoder));
     }
 
     #[cfg(unix)]

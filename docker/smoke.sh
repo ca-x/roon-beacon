@@ -62,6 +62,23 @@ test "$unauthenticated" = 401
 cookie=$(mktemp)
 login
 wait_for_audio
+network=$(curl --fail --silent --cookie "$cookie" http://127.0.0.1:9339/api/audio/network)
+interface=$(jq -er '.interfaces[0].name' <<< "$network")
+curl --fail --silent --cookie "$cookie" \
+    -H 'Content-Type: application/json' -H 'Origin: http://127.0.0.1:9339' \
+    --data "$(jq -cn --arg interface "$interface" '{interface: $interface}')" \
+    http://127.0.0.1:9339/api/audio/network
+configured=false
+for ((attempt = 0; attempt < 30; attempt++)); do
+    if docker exec "$container" grep -F -- "interface = \"$interface\";" /data/audio/shairport-sync.conf; then
+        configured=true
+        break
+    fi
+    sleep .2
+done
+test "$configured" = true
+sleep 1
+wait_for_audio
 docker exec "$container" dbus-send --system --type=method_call --print-reply \
     --dest=org.freedesktop.Avahi / org.freedesktop.Avahi.Server.GetState | grep -q 'int32 2'
 docker exec "$container" sh -c 'printf persisted > /data/.smoke-persistence'
@@ -70,6 +87,9 @@ exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container")
 test "$exit_code" != 137
 docker start "$container" >/dev/null
 wait_for_health
+curl --fail --silent --cookie "$cookie" http://127.0.0.1:9339/api/audio/network \
+    | jq -e --arg interface "$interface" '.interface == $interface'
+wait_for_audio
 docker exec "$container" test -d /data/audio
 test "$(docker exec "$container" cat /data/.smoke-persistence)" = persisted
 docker stop --time 15 "$container" >/dev/null
@@ -87,6 +107,8 @@ docker run -d --name "$container" --network host \
 wait_for_health
 login
 wait_for_audio streaming
+curl --fail --silent --cookie "$cookie" http://127.0.0.1:9339/api/audio/status \
+    | jq -e '.pcm_bytes_received > 0 and .bytes_streamed > 0'
 curl_status=0
 http_status=$(curl --silent --show-error --max-time 3 --cookie "$cookie" \
     --output "$synthetic_dir/stream.mp3" --write-out '%{http_code}' \
