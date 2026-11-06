@@ -25,7 +25,8 @@ fn mock_zone() -> Value {
     json!({"zone_id":"zone-a","display_name":"Living room","state":"playing",
         "is_previous_allowed":true,"is_next_allowed":true,"is_play_allowed":false,
         "is_pause_allowed":true,"is_seek_allowed":true,
-        "outputs":[{"output_id":"out-a","display_name":"Speaker","volume":{"type":"number","min":0,"max":100,"step":1,"value":32,"is_muted":false}}],
+        "settings":{"shuffle":false,"loop":"disabled","auto_radio":false},
+        "outputs":[{"output_id":"out-a","display_name":"Speaker","can_group_with_output_ids":["out-b"],"source_controls":[{"control_key":"source-a","display_name":"Amplifier","status":"selected","supports_standby":true}],"volume":{"type":"number","min":0,"max":100,"step":1,"value":32,"is_muted":false}}],
         "now_playing":{"length":240,"seek_position":12,"image_key":"cover-a","one_line":{"line1":"A real test track"},"two_line":{"line1":"A real test track","line2":"An artist"}}})
 }
 
@@ -81,6 +82,9 @@ async fn mock_core(id: &str, authorized_initially: bool) -> MockCore {
                                             zone_request=Some(request.request_id);
                                             (MooVerb::Continue,"Subscribed",json!({"zones":[mock_zone()]}))
                                         },
+                                        "com.roonlabs.transport:2/subscribe_outputs"=>(MooVerb::Continue,"Subscribed",json!({"outputs":[mock_zone()["outputs"][0],{"output_id":"out-b","display_name":"Kitchen","can_group_with_output_ids":["out-a"],"volume":{"type":"incremental"}}]})),
+                                        "com.roonlabs.transport:2/get_zones"=>(MooVerb::Complete,"Success",json!({"zones":[mock_zone()]})),
+                                        "com.roonlabs.transport:2/get_outputs"=>(MooVerb::Complete,"Success",json!({"outputs":[mock_zone()["outputs"][0]]})),
                                         "com.roonlabs.browse:1/browse" if request.json_body().is_some_and(|body|body["item_key"]=="message-error")=>(MooVerb::Complete,"Success",json!({"action":"message","message":"This album cannot be played","is_error":true})),
                                         "com.roonlabs.browse:1/browse"=>(MooVerb::Complete,"Success",json!({"action":"list","list":{"title":"Albums","count":1,"level":1}})),
                                         "com.roonlabs.browse:1/load"=>(MooVerb::Complete,"Success",json!({"offset":0,"items":[{"title":"Kind of Blue","subtitle":"Miles Davis","item_key":"item-1","hint":"action_list"}]})),
@@ -148,6 +152,223 @@ async fn api(player: &Player, path: &str, body: Value) -> (StatusCode, Value) {
     let status = response.status();
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn typed_transport_operations_are_forwarded_and_failures_are_not_swallowed() {
+    let server = mock_core("core-a", true).await;
+    let directory = tempfile::tempdir().unwrap();
+    let player = Player::new(SecureState::open(directory.path()).unwrap()).unwrap();
+    player.observe(server.endpoint.clone()).await;
+    wait_for(&player, |state| {
+        state.zones.len() == 1 && state.outputs.len() == 2
+    })
+    .await;
+    for (action, method, expected) in [
+        (
+            json!({"action":"settings","zone_id":"zone-a","shuffle":true,"loop_mode":"loop_one","auto_radio":true}),
+            "change_settings",
+            json!({"settings":{"shuffle":true,"loop":"loop_one","auto_radio":true}}),
+        ),
+        (
+            json!({"action":"group","output_ids":["out-a","out-b"]}),
+            "group_outputs",
+            json!({"output_ids":["out-a","out-b"]}),
+        ),
+        (
+            json!({"action":"source","output_id":"out-a","control_key":"source-a","command":"standby"}),
+            "standby",
+            json!({"output_id":"out-a","control_key":"source-a"}),
+        ),
+        (
+            json!({"action":"source","output_id":"out-a","control_key":"source-a","command":"toggle_standby"}),
+            "toggle_standby",
+            json!({"output_id":"out-a","control_key":"source-a"}),
+        ),
+        (
+            json!({"action":"source","output_id":"out-a","control_key":"source-a","command":"convenience_switch"}),
+            "convenience_switch",
+            json!({"output_id":"out-a","control_key":"source-a"}),
+        ),
+        (
+            json!({"action":"relative_volume","output_id":"out-b","steps":-1}),
+            "change_volume",
+            json!({"output_id":"out-b","how":"relative_step","value":-1.0}),
+        ),
+        (
+            json!({"action":"seek_relative","zone_id":"zone-a","seconds":10}),
+            "seek",
+            json!({"zone_or_output_id":"zone-a","how":"relative","seconds":10}),
+        ),
+        (json!({"action":"pause_all"}), "pause_all", Value::Null),
+    ] {
+        let mut input = action;
+        input["core_id"] = json!("core-a");
+        let (status, body) = api(&player, "/api/player/transport", input.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let recorded = server.requests.lock().await;
+        let (_, sent) = recorded
+            .iter()
+            .rev()
+            .find(|(name, _)| name == &format!("com.roonlabs.transport:2/{method}"))
+            .unwrap();
+        if let Some(fields) = expected.as_object() {
+            for (key, value) in fields {
+                assert_eq!(&sent[key], value);
+            }
+        } else {
+            assert!(sent.is_null());
+        }
+        drop(recorded);
+        server.fail_commands.store(true, Ordering::Relaxed);
+        let (status, body) = api(&player, "/api/player/transport", input).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("NotSupported"));
+        server.fail_commands.store(false, Ordering::Relaxed);
+    }
+    player.shutdown().await;
+}
+
+#[tokio::test]
+async fn transport_rejects_stale_core_invalid_groups_and_unknown_source_controls() {
+    let server = mock_core("core-a", true).await;
+    let directory = tempfile::tempdir().unwrap();
+    let player = Player::new(SecureState::open(directory.path()).unwrap()).unwrap();
+    player.observe(server.endpoint.clone()).await;
+    wait_for(&player, |state| {
+        state.outputs.len() == 2 && state.zones.len() == 1
+    })
+    .await;
+    let (status, _) = api(
+        &player,
+        "/api/player/transport",
+        json!({"core_id":"core-b","action":"pause_all"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    for (path, input) in [
+        (
+            "/api/player/control",
+            json!({"core_id":"core-b","zone_id":"zone-a","control":"pause"}),
+        ),
+        (
+            "/api/player/seek",
+            json!({"core_id":"core-b","zone_id":"zone-a","seconds":10}),
+        ),
+        (
+            "/api/player/volume",
+            json!({"core_id":"core-b","output_id":"out-a","value":20}),
+        ),
+        (
+            "/api/player/mute",
+            json!({"core_id":"core-b","output_id":"out-a","is_muted":true}),
+        ),
+    ] {
+        assert_eq!(api(&player, path, input).await.0, StatusCode::CONFLICT);
+    }
+    for action in [
+        json!({"action":"group","output_ids":["out-a","out-a"]}),
+        json!({"action":"group","output_ids":["out-a","unknown"]}),
+        json!({"action":"group","output_ids":["out-a"]}),
+        json!({"action":"ungroup","output_ids":["out-a"]}),
+        json!({"action":"source","output_id":"out-a","control_key":"invalid","command":"standby"}),
+        json!({"action":"relative_volume","output_id":"out-b","steps":100}),
+        json!({"action":"seek_relative","zone_id":"zone-a","seconds":61}),
+        json!({"action":"transfer","from_zone_id":"zone-a","to_zone_id":"zone-a"}),
+        json!({"action":"settings","zone_id":"unknown","shuffle":true}),
+    ] {
+        let mut action = action;
+        action["core_id"] = json!("core-a");
+        let (status, body) = api(&player, "/api/player/transport", action).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    player.shutdown().await;
+}
+
+#[tokio::test]
+async fn manual_refresh_uses_typed_zone_and_output_snapshots() {
+    let server = mock_core("core-a", true).await;
+    let directory = tempfile::tempdir().unwrap();
+    let player = Player::new(SecureState::open(directory.path()).unwrap()).unwrap();
+    player.observe(server.endpoint.clone()).await;
+    wait_for(&player, |state| {
+        state.outputs.len() == 2 && !state.zones.is_empty()
+    })
+    .await;
+    let (status, body) = api(
+        &player,
+        "/api/player/transport",
+        json!({"core_id":"core-a","action":"refresh"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let state = snapshot(State(player.clone())).await.0;
+    assert_eq!(state.outputs.len(), 1);
+    assert_eq!(state.zones.len(), 1);
+    assert_eq!(state.zones[0]["settings"]["loop"], "disabled");
+    player.shutdown().await;
+}
+
+#[tokio::test]
+async fn grouped_outputs_can_be_ungrouped_and_queues_transferred() {
+    let server = mock_core("core-a", true).await;
+    let directory = tempfile::tempdir().unwrap();
+    let player = Player::new(SecureState::open(directory.path()).unwrap()).unwrap();
+    player.observe(server.endpoint.clone()).await;
+    wait_for(&player, |state| !state.zones.is_empty()).await;
+    let mut grouped = mock_zone();
+    grouped["outputs"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"output_id":"out-b","display_name":"Kitchen"}));
+    let mut destination = mock_zone();
+    destination["zone_id"] = json!("zone-b");
+    destination["outputs"] = json!([]);
+    server
+        .changes
+        .send(json!({"zones_changed":[grouped],"zones_added":[destination]}))
+        .unwrap();
+    wait_for(&player, |state| state.zones.len() == 2).await;
+    for action in [
+        json!({"action":"ungroup","output_ids":["out-b"]}),
+        json!({"action":"transfer","from_zone_id":"zone-a","to_zone_id":"zone-b"}),
+    ] {
+        let mut action = action;
+        action["core_id"] = json!("core-a");
+        assert_eq!(
+            api(&player, "/api/player/transport", action).await.0,
+            StatusCode::OK
+        );
+    }
+    let recorded = server.requests.lock().await;
+    assert!(recorded
+        .iter()
+        .any(|(name, body)| name.ends_with("/transfer_zone")
+            && body["from_zone_or_output_id"] == "zone-a"
+            && body["to_zone_or_output_id"] == "zone-b"));
+    drop(recorded);
+    player.shutdown().await;
+}
+
+#[test]
+fn mixed_output_events_apply_every_collection_and_removal() {
+    let mut outputs = BTreeMap::new();
+    apply_outputs(
+        &mut outputs,
+        "Subscribed",
+        &json!({"outputs":[{"output_id":"old"}]}),
+    );
+    apply_outputs(
+        &mut outputs,
+        "Changed",
+        &json!({"outputs_added":[{"output_id":"new"}],"outputs_changed":[{"output_id":"old","display_name":"Updated"}]}),
+    );
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs["old"]["display_name"], "Updated");
+    apply_outputs(&mut outputs, "Changed", &json!({"outputs_removed":["old"]}));
+    assert_eq!(outputs.len(), 1);
+    apply_outputs(&mut outputs, "Subscribed", &json!({"outputs":[]}));
+    assert!(outputs.is_empty());
 }
 
 #[tokio::test]

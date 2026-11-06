@@ -43,6 +43,11 @@ export function App() {
   const [token, setToken] = useState('');
   const [loginError, setLoginError] = useState('');
   const [loggingIn, setLoggingIn] = useState(false);
+  const [desktopToken] = useState(() => {
+    const value = new URLSearchParams(location.hash.slice(1)).get('desktop-token');
+    return value && /^[a-f0-9]{64}$/.test(value) ? value : '';
+  });
+  const [bootstrapping, setBootstrapping] = useState(Boolean(desktopToken));
   const main = useRef<HTMLElement>(null);
   const authButton = useRef<HTMLButtonElement>(null);
   const text: Translate = (key, values = {}) => {
@@ -77,7 +82,12 @@ export function App() {
     return () => { document.removeEventListener('pointerdown', pointer, true); document.removeEventListener('keydown', keyboard, true); };
   }, []);
 
-  const auth = useQuery({ queryKey: ['auth'], queryFn: ({ signal }) => request<Auth>('/api/auth', undefined, signal), refetchInterval: 6000 });
+  const auth = useQuery({ queryKey: ['auth'], enabled: !bootstrapping, queryFn: ({ signal }) => request<Auth>('/api/auth', undefined, signal), refetchInterval: 6000 });
+  useEffect(() => {
+    if (!desktopToken) return;
+    history.replaceState(null, '', location.pathname + location.search);
+    request('/api/login', { token: desktopToken }).catch((failure) => setAppError(errorMessage(failure))).finally(() => setBootstrapping(false));
+  }, [desktopToken]);
   const locked = !auth.data || (auth.data.required && !auth.data.authenticated);
   useLayoutEffect(() => { if (main.current) main.current.inert = locked; }, [locked]);
   useEffect(() => { if (auth.data?.required && !auth.data.authenticated) setDialogOpen(true); }, [auth.data]);
@@ -107,6 +117,7 @@ export function App() {
   const status = useQuery({ queryKey: ['status', epoch], enabled: !locked, queryFn: ({ signal }) => request<Status>('/api/status', undefined, signal), refetchInterval: 6000 });
   const audio = useQuery({ queryKey: ['audio', epoch], enabled: !locked, queryFn: ({ signal }) => request<AudioStatus>('/api/audio/status', undefined, signal), refetchInterval: 6000 });
   const coreId = player.data?.selected_core_id || null;
+  const native = Boolean(desktopToken) || audio.data?.mode === 'native';
   const core = player.data?.cores.find((candidate) => candidate.core_id === coreId);
   const zones = player.data?.zones || [];
   const zone = zones.find((candidate) => candidate.zone_id === zoneId) || zones[0];
@@ -122,7 +133,7 @@ export function App() {
   return <I18n.Provider value={text}>
     <a className="skip-link" href="#main">{text('skip')}</a>
     <div className="shell">
-      <header className="masthead"><a className="brand" href="/" aria-label="Roon Beacon"><img className="brand-logo" src="/assets/logo.png" alt="Roon Beacon" width={60} height={60} /><span>Roon <strong>Beacon</strong><small>{text('subtitle')}</small></span></a>
+      <header className="masthead"><a className="brand" href="/" aria-label="Roon Beacon"><img className="brand-logo" src="/assets/logo.png" alt="Roon Beacon" width={60} height={60} /><span>Roon <strong>Beacon</strong><small>{text(native ? 'desktopSubtitle' : 'subtitle')}</small></span></a>
         <div className="header-actions"><div className="language" role="group" aria-label="Language / 语言"><Button data-lang="en" lang="en" aria-pressed={lang === 'en'} onClick={() => setLang('en')}>EN</Button><Button data-lang="zh" lang="zh-CN" aria-pressed={lang === 'zh'} onClick={() => setLang('zh')}>中文</Button></div>
           <label className="theme-choice"><span className="sr-only">{lang === 'zh' ? '主题' : 'Theme'}</span><select id="themeSelect" value={theme} onChange={(event) => setTheme(event.target.value as Theme)}><option value="light">{lang === 'zh' ? '浅色' : 'Light'}</option><option value="dark">{lang === 'zh' ? '深色' : 'Dark'}</option><option value="system">{lang === 'zh' ? '跟随系统' : 'System'}</option></select></label>
           <Button ref={authButton} id="authButton" className="text-button" hidden={!auth.data?.required} onClick={async () => {
@@ -164,9 +175,9 @@ export function App() {
         </section>
         <div className="music-layout">
           <LibraryPanel key={`${epoch}:${coreId}:${core?.connection}`} ready={ready} zoneId={zone?.zone_id || ''} session={session} />
-          <aside className="listening" aria-label={text('nowPlaying')}><PlayerPanel coreId={coreId} zone={zone} ready={ready} refresh={refreshPlayer} /><BrowserAudio status={audio.isError ? undefined : audio.data} locked={locked} statusError={errorMessage(audio.error)} /></aside>
+          <aside className="listening" aria-label={text('nowPlaying')}><PlayerPanel coreId={coreId} zone={zone} zones={zones} outputs={player.data?.outputs || []} ready={ready} refresh={refreshPlayer} /><BrowserAudio status={audio.isError ? undefined : audio.data} locked={locked} statusError={errorMessage(audio.error)} /></aside>
         </div>
-        <Settings status={status.data} statusError={errorMessage(status.error)} locked={locked} refresh={async () => { await status.refetch(); }} />
+        <Settings native={native} status={status.data} statusError={errorMessage(status.error)} locked={locked} refresh={async () => { await status.refetch(); }} />
       </main>
     </div>
     <Dialog.Root open={dialogOpen} onOpenChange={changeDialog}><Dialog.Portal><Dialog.Overlay className="dialog-overlay" /><Dialog.Content id="loginDialog" className="login-dialog" aria-labelledby="loginHeading" aria-describedby="loginHint" onCloseAutoFocus={(event) => { event.preventDefault(); authButton.current?.focus(); }}>

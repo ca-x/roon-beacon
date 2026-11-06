@@ -1,0 +1,37 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Roon Beacon",
+  "version": "0.3.0",
+  "identifier": "io.github.ca-x.roon-beacon.desktop",
+  "build": {
+    "beforeBuildCommand": "npm --prefix ../web run build",
+    "frontendDist": "../crates/roon-beacon/src/web"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; media-src 'self'; connect-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "publisher": "Roon Beacon contributors",
+    "targets": ["deb"],
+    "category": "Music",
+    "shortDescription": "A Roon remote and AirPlay output for Linux",
+    "longDescription": "Browse and control your Roon library and listen through the system audio device using an integrated Shairport Sync receiver. Roon Bridge is not required. Requires a Roon Server and subscription. Audio uses AirPlay, not RAAT.",
+    "icon": ["icons/128x128.png"],
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/share/doc/roon-beacon-desktop/README.md": "README.md",
+          "/usr/share/doc/roon-beacon-desktop/copyright": "../LICENSE",
+          "/usr/share/doc/roon-beacon-desktop/ROON-SDK-LICENSE-MIT": "../vendor/roon-api/LICENSE-MIT",
+          "/usr/share/doc/roon-beacon-desktop/ROON-SDK-LICENSE-APACHE": "../vendor/roon-api/LICENSE-APACHE",
+          "/usr/share/doc/roon-beacon-desktop/FRONTEND-NOTICES.md": "../web/THIRD_PARTY_NOTICES.md"
+        },
+        "depends": ["shairport-sync", "avahi-daemon", "libasound2 | libasound2t64", "libasound2-plugins"]
+      }
+    }
+  }
+}

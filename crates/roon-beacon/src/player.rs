@@ -14,6 +14,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use roon_api::{
+    ControlAction, Core, MuteAction, Output, RoonClient, RoonClientBuilder, RoonEvent, SeekMode,
+    Transport, VolumeMode,
+};
 use roon_moo::{
     connection::{MooConnection, ServiceHandler},
     MooMessage, MooVerb,
@@ -27,6 +31,9 @@ use tokio::time::{sleep, timeout};
 use crate::persistence::SecureState;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+mod transport;
+use transport::transport_action;
 
 #[derive(Clone)]
 pub struct Player {
@@ -52,6 +59,7 @@ struct CoreEntry {
     endpoint: watch::Sender<DiscoveredCore>,
     peer: Option<Arc<Peer>>,
     zones: BTreeMap<String, Value>,
+    outputs: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Serialize)]
@@ -69,11 +77,13 @@ struct PlayerSnapshot {
     cores: Vec<CoreSummary>,
     selected_core_id: Option<String>,
     zones: Vec<Value>,
+    outputs: Vec<Value>,
     discovery_error: Option<String>,
 }
 
 struct Peer {
-    connection: Option<MooConnection>,
+    connection: Option<Arc<MooConnection>>,
+    core: Option<Core>,
     failed: AtomicBool,
     requests: Semaphore,
     browse: Mutex<()>,
@@ -81,6 +91,26 @@ struct Peer {
 }
 
 impl Peer {
+    fn transport(&self) -> Transport {
+        self.core.as_ref().expect("registered peer").transport()
+    }
+
+    async fn command<ResponseValue>(
+        &self,
+        future: impl std::future::Future<
+            Output = std::result::Result<ResponseValue, roon_api::ApiError>,
+        >,
+    ) -> Result<ResponseValue> {
+        let _permit = timeout(REQUEST_TIMEOUT, self.requests.acquire()).await??;
+        match timeout(REQUEST_TIMEOUT, future).await {
+            Ok(result) => result.map_err(Into::into),
+            Err(_) => {
+                self.failed.store(true, Ordering::Relaxed);
+                bail!("Roon request timed out; reconnecting")
+            }
+        }
+    }
+
     fn connection(&self) -> &MooConnection {
         self.connection
             .as_ref()
@@ -110,9 +140,14 @@ impl Peer {
 
 impl Drop for Peer {
     fn drop(&mut self) {
+        self.core.take();
         if let Some(connection) = self.connection.take() {
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(connection.close());
+                runtime.spawn(async move {
+                    if let Ok(connection) = Arc::try_unwrap(connection) {
+                        connection.close().await;
+                    }
+                });
             }
         }
     }
@@ -147,6 +182,7 @@ impl Player {
             .route("/api/player/seek", post(seek))
             .route("/api/player/volume", post(volume))
             .route("/api/player/mute", post(mute))
+            .route("/api/player/transport", post(transport_action))
             .route("/api/player/browse", post(browse))
             .route("/api/player/image/:image_key", get(image))
             .with_state(self.clone())
@@ -298,6 +334,7 @@ impl Player {
                 endpoint,
                 peer: None,
                 zones: BTreeMap::new(),
+                outputs: BTreeMap::new(),
             },
         );
         drop(state);
@@ -324,6 +361,7 @@ impl Player {
                             }
                             entry.peer = None;
                             entry.zones.clear();
+                            entry.outputs.clear();
                         }
                     }
                     tokio::select! {
@@ -349,6 +387,7 @@ impl Player {
         if let Some(entry) = self.inner.state.write().await.cores.get_mut(core_id) {
             entry.peer = None;
             entry.zones.clear();
+            entry.outputs.clear();
         }
     }
 
@@ -371,13 +410,14 @@ impl Player {
             SocketAddr::new(endpoint.host, endpoint.http_port)
         );
         let connection = timeout(REQUEST_TIMEOUT, MooConnection::connect(&url, handlers)).await??;
-        let peer = Arc::new(Peer {
-            connection: Some(connection),
+        let mut peer = Peer {
+            connection: Some(Arc::new(connection)),
+            core: None,
             failed: AtomicBool::new(false),
             requests: Semaphore::new(16),
             browse: Mutex::new(()),
             endpoint: endpoint.clone(),
-        });
+        };
         let info = peer.request("com.roonlabs.registry:1/info", None).await?;
         let info = info
             .json_body()
@@ -457,11 +497,44 @@ impl Player {
             .as_str()
             .context("Roon registration did not provide an authorization token")?;
         self.inner.store.save_token(&endpoint.core_id, token)?;
+        let client: RoonClient = RoonClientBuilder::new(
+            "io.github.ca-x.roon-beacon",
+            "Roon Beacon",
+            env!("CARGO_PKG_VERSION"),
+            "Roon Beacon contributors",
+            "roon-beacon@users.noreply.github.com",
+        )
+        .require_transport()
+        .require_browse()
+        .build()?;
+        let mut client_events = client.events();
+        peer.core = Some(client.attach_registered(
+            peer.connection.as_ref().unwrap().clone(),
+            &endpoint.core_id,
+            info["display_name"].as_str().unwrap_or("Roon Server"),
+            &endpoint.host.to_string(),
+            endpoint.http_port,
+        ));
+        if let RoonEvent::CorePaired(core) = client_events.recv().await? {
+            tracing::info!(
+                core_id = core.core_id(),
+                "Roon SDK attached to registered Core"
+            );
+        }
+        drop(client_events);
+        let peer = Arc::new(peer);
         let mut events = peer
             .connection()
             .subscribe(
                 "com.roonlabs.transport:2/subscribe_zones",
                 json!({"subscription_key":0}),
+            )
+            .await?;
+        let mut output_events = peer
+            .connection()
+            .subscribe(
+                "com.roonlabs.transport:2/subscribe_outputs",
+                json!({"subscription_key":1}),
             )
             .await?;
         if let Some(entry) = self
@@ -479,6 +552,15 @@ impl Player {
         let mut health = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
+                result = output_events.recv() => {
+                    let event = result.context("Roon output subscription closed")?;
+                    if event.verb == MooVerb::Complete { bail!("Roon output subscription ended"); }
+                    if let Some(body) = event.json_body() {
+                        if let Some(entry) = self.inner.state.write().await.cores.get_mut(&endpoint.core_id) {
+                            apply_outputs(&mut entry.outputs, &event.name, body);
+                        }
+                    }
+                }
                 registration = registration_events.recv() => {
                     let registration = registration.context("Roon registration connection closed")?;
                     if registration.name == "Registered" && registration.verb == MooVerb::Continue {
@@ -524,6 +606,20 @@ impl Player {
         Ok((peer, entry.zones.values().cloned().collect()))
     }
 
+    async fn selected_for(
+        &self,
+        expected: Option<&str>,
+    ) -> Result<(Arc<Peer>, Vec<Value>), ApiError> {
+        let selected = self.selected().await?;
+        if expected.is_some_and(|id| id != selected.0.endpoint.core_id) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "Roon Server changed; try again",
+            ));
+        }
+        Ok(selected)
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.inner.stop.send(true);
         let tasks = std::mem::take(&mut *self.inner.tasks.lock().unwrap());
@@ -532,6 +628,26 @@ impl Player {
                 task.abort();
                 let _ = task.await;
             }
+        }
+    }
+}
+
+fn apply_outputs(outputs: &mut BTreeMap<String, Value>, status: &str, body: &Value) {
+    if status == "Subscribed" {
+        outputs.clear();
+    }
+    for key in ["outputs", "outputs_added", "outputs_changed"] {
+        if let Some(updates) = body[key].as_array() {
+            for output in updates {
+                if let Some(id) = output["output_id"].as_str() {
+                    outputs.insert(id.to_string(), output.clone());
+                }
+            }
+        }
+    }
+    if let Some(removed) = body["outputs_removed"].as_array() {
+        for id in removed.iter().filter_map(Value::as_str) {
+            outputs.remove(id);
         }
     }
 }
@@ -617,6 +733,13 @@ async fn snapshot(State(player): State<Player>) -> Json<PlayerSnapshot> {
             .map(|entry| entry.zones.values().cloned().collect())
             .unwrap_or_default(),
         discovery_error: state.discovery_error.clone(),
+        outputs: state
+            .selected_core_id
+            .as_ref()
+            .and_then(|id| state.cores.get(id))
+            .filter(|entry| entry.summary.connection == "connected")
+            .map(|entry| entry.outputs.values().cloned().collect())
+            .unwrap_or_default(),
     })
 }
 
@@ -650,20 +773,21 @@ enum Control {
 }
 
 impl Control {
-    fn as_str(&self) -> &'static str {
+    fn action(&self) -> ControlAction {
         match self {
-            Self::Play => "play",
-            Self::Pause => "pause",
-            Self::Playpause => "playpause",
-            Self::Stop => "stop",
-            Self::Previous => "previous",
-            Self::Next => "next",
+            Self::Play => ControlAction::Play,
+            Self::Pause => ControlAction::Pause,
+            Self::Playpause => ControlAction::PlayPause,
+            Self::Stop => ControlAction::Stop,
+            Self::Previous => ControlAction::Previous,
+            Self::Next => ControlAction::Next,
         }
     }
 }
 
 #[derive(Deserialize)]
 struct ControlRequest {
+    core_id: Option<String>,
     zone_id: String,
     control: Control,
 }
@@ -679,7 +803,7 @@ async fn control(
     State(player): State<Player>,
     Json(input): Json<ControlRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let (peer, zones) = player.selected().await?;
+    let (peer, zones) = player.selected_for(input.core_id.as_deref()).await?;
     let zone = selected_zone(&zones, &input.zone_id)?;
     let capability = match input.control {
         Control::Play => Some("is_play_allowed"),
@@ -698,9 +822,9 @@ async fn control(
             "This playback action is not currently available",
         ));
     }
-    peer.request(
-        "com.roonlabs.transport:2/control",
-        Some(json!({"zone_or_output_id":input.zone_id,"control":input.control.as_str()})),
+    peer.command(
+        peer.transport()
+            .control(&input.zone_id, input.control.action()),
     )
     .await?;
     Ok(Json(json!({"ok":true})))
@@ -708,6 +832,7 @@ async fn control(
 
 #[derive(Deserialize)]
 struct SeekRequest {
+    core_id: Option<String>,
     zone_id: String,
     seconds: f64,
 }
@@ -716,7 +841,7 @@ async fn seek(
     State(player): State<Player>,
     Json(input): Json<SeekRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let (peer, zones) = player.selected().await?;
+    let (peer, zones) = player.selected_for(input.core_id.as_deref()).await?;
     let zone = selected_zone(&zones, &input.zone_id)?;
     let length = zone["now_playing"]["length"].as_f64().unwrap_or(0.0);
     if zone["is_seek_allowed"].as_bool() != Some(true)
@@ -728,12 +853,18 @@ async fn seek(
             "Seek position is unavailable or outside the current track",
         ));
     }
-    peer.request("com.roonlabs.transport:2/seek",Some(json!({"zone_or_output_id":input.zone_id,"how":"absolute","seconds":input.seconds.round()}))).await?;
+    peer.command(peer.transport().seek(
+        &input.zone_id,
+        SeekMode::Absolute,
+        input.seconds.round() as i64,
+    ))
+    .await?;
     Ok(Json(json!({"ok":true})))
 }
 
 #[derive(Deserialize)]
 struct VolumeRequest {
+    core_id: Option<String>,
     output_id: String,
     value: f64,
 }
@@ -754,7 +885,7 @@ async fn volume(
     State(player): State<Player>,
     Json(input): Json<VolumeRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let (peer, zones) = player.selected().await?;
+    let (peer, zones) = player.selected_for(input.core_id.as_deref()).await?;
     let volume = &selected_output(&zones, &input.output_id)?["volume"];
     let minimum = volume["min"].as_f64().unwrap_or(0.0);
     let maximum = volume["max"].as_f64().unwrap_or(0.0);
@@ -767,16 +898,18 @@ async fn volume(
             "Output volume is fixed, unsupported, or outside its allowed range",
         ));
     }
-    peer.request(
-        "com.roonlabs.transport:2/change_volume",
-        Some(json!({"output_id":input.output_id,"how":"absolute","value":input.value})),
-    )
+    peer.command(peer.transport().change_volume(
+        &input.output_id,
+        VolumeMode::Absolute,
+        input.value,
+    ))
     .await?;
     Ok(Json(json!({"ok":true})))
 }
 
 #[derive(Deserialize)]
 struct MuteRequest {
+    core_id: Option<String>,
     output_id: String,
     is_muted: bool,
 }
@@ -785,17 +918,21 @@ async fn mute(
     State(player): State<Player>,
     Json(input): Json<MuteRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let (peer, zones) = player.selected().await?;
+    let (peer, zones) = player.selected_for(input.core_id.as_deref()).await?;
     if selected_output(&zones, &input.output_id)?["volume"]["is_muted"]
         .as_bool()
         .is_none()
     {
         return Err(ApiError::bad("This output does not support mute"));
     }
-    peer.request(
-        "com.roonlabs.transport:2/mute",
-        Some(json!({"output_id":input.output_id,"how":if input.is_muted {"mute"} else {"unmute"}})),
-    )
+    peer.command(peer.transport().mute(
+        &input.output_id,
+        if input.is_muted {
+            MuteAction::Mute
+        } else {
+            MuteAction::Unmute
+        },
+    ))
     .await?;
     Ok(Json(json!({"ok":true})))
 }

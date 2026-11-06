@@ -123,6 +123,8 @@ jobs:
           cp "target/${TARGET}/release/${EXE}" package/
           cp README.md README.zh-CN.md LICENSE package/
           cp web/THIRD_PARTY_NOTICES.md package/
+          cp vendor/roon-api/LICENSE-MIT package/ROON-SDK-LICENSE-MIT
+          cp vendor/roon-api/LICENSE-APACHE package/ROON-SDK-LICENSE-APACHE
 
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
             (cd package && 7z a -tzip "../dist/${ARCHIVE}" ./*)

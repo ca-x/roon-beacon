@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Volume2 } from 'lucide-react';
+import { Speaker, Volume2 } from 'lucide-react';
 import { Button, Notice, useText } from './ui';
 import { errorMessage } from './api';
 import type { AudioStatus } from './types';
@@ -33,6 +33,16 @@ export function BrowserAudio({ status, locked, statusError }: { status?: AudioSt
     window.addEventListener('pagehide', leave);
     return () => { window.removeEventListener('pagehide', leave); leave(); };
   }, [leave]);
+
+  if (status?.mode === 'native') return <section className="browser-listening native-listening" aria-labelledby="nativeHeading">
+    <div className="audio-heading"><h2 id="nativeHeading"><Speaker aria-hidden="true" />{text('nativeListening')}</h2><span className="experimental">{text('nativeBadge')}</span></div>
+    <p className="native-intro">{text('nativeIntro')}</p>
+    <p className="small-note native-status" role="status">{text(status.available ? 'nativeReady' : status.state === 'starting' ? 'audioStarting' : 'nativeUnavailable', { name: status.name || 'Roon Beacon Desktop' })}</p>
+    <p className="small-note">{text('nativeSetup', { name: status.name || 'Roon Beacon Desktop' })}</p>
+    <details className="native-details"><summary>{text('nativeBadge')}</summary><p className="small-note">{text('nativeQuality')}</p></details>
+    <Notice id="nativeAudioError" error={status.error || statusError} />
+    {status.receiver_diagnostics && <details className="audio-diagnostics"><summary>{text('nativeDiagnostics')}</summary><pre>{status.receiver_diagnostics}</pre></details>}
+  </section>;
 
   const join = () => {
     if (!audio.current || joinedRef.current) return;

@@ -207,7 +207,61 @@ dd { margin: .25rem 0 0; overflow-wrap: anywhere; font-size: .875rem; }
 .checkbox-field input { width: 20px; height: 20px; accent-color: var(--accent); margin: 0; }
 footer { display: flex; justify-content: space-between; gap: 1rem; padding: 1.5rem 0 2rem; color: var(--muted); font-size: .6875rem; }
 #version:not(:empty)::after { content: " · "; }
+.transport-tools { grid-column: 1 / -1; margin: .5rem 0 1.5rem; }
+.playback-options { display: flex; align-items: center; justify-content: center; gap: .5rem; }
+.mode-button { min-width: 44px; min-height: 44px; color: var(--muted); padding: .625rem; }
+.mode-button[aria-pressed="true"] { color: var(--accent-hover); background: var(--accent-soft); }
+.mode-button svg, .seek-shortcuts svg { width: 18px; height: 18px; }
+.radio-mode { gap: .5rem; font-size: .75rem; }
+.seek-shortcuts { display: flex; align-items: center; justify-content: space-between; gap: .5rem; margin: .5rem 0 .875rem; }
+.seek-shortcuts .small-note { text-align: center; font-variant-numeric: tabular-nums; }
+.seek-shortcuts button { gap: .25rem; min-width: 64px; }
+.output-manager-trigger { display: flex; width: 100%; justify-content: start; gap: .75rem; text-align: left; }
+.output-manager-trigger svg:last-child { margin-left: auto; width: 16px; color: var(--muted); }
+.output-dialog { position: fixed; z-index: 31; inset: 50% auto auto 50%; transform: translate(-50%, -50%); display: flex; flex-direction: column; width: min(600px, calc(100% - 32px)); max-height: min(840px, calc(100dvh - 32px)); overflow: hidden; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); box-shadow: 0 16px 80px #2b29262b; }
+.output-dialog-heading { display: flex; align-items: start; gap: .75rem; padding: 1.5rem 1.5rem 1.25rem; border-bottom: 1px solid var(--line); }
+.output-dialog-heading > div { flex: 1; min-width: 0; }
+.output-dialog-heading h2 { font-size: 1.375rem; letter-spacing: -.035em; margin-bottom: .5rem; }
+.output-dialog-heading p { margin: 0; }
+.output-dialog-heading, .output-dialog-footer { flex-shrink: 0; position: relative; z-index: 1; background: var(--surface); }
+.output-dialog-scroll { min-height: 0; flex: 1 1 auto; overflow-y: auto; overscroll-behavior: contain; scroll-padding-block: 1.25rem; padding: 1.25rem 1.5rem; }
+.output-picker { border: 0; padding: 0; margin: 0; min-width: 0; }
+.output-picker legend { font-weight: 600; font-size: .875rem; margin-bottom: .75rem; }
+.output-device { padding: .75rem 0; border-bottom: 1px solid var(--line); }
+.output-choice { display: flex; gap: .75rem; align-items: center; min-height: 48px; position: relative; cursor: pointer; }
+.output-choice input { position: absolute; opacity: 0; width: 100%; height: 100%; inset: 0; cursor: pointer; margin: 0; }
+.output-choice:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 4px; }
+.output-choice:has(input:disabled) { opacity: .5; cursor: not-allowed; }
+.output-choice > svg { color: var(--muted); width: 20px; flex: none; }
+.output-choice small { display: block; color: var(--muted); font-size: .75rem; }
+.output-check { display: grid; place-items: center; flex: none; width: 24px; height: 24px; border: 1px solid var(--control-line); border-radius: 6px; color: transparent; }
+.output-check svg { width: 16px; height: 16px; }
+.output-choice:has(input:checked) .output-check { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+.device-step-volume { display: flex; justify-content: flex-end; align-items: center; gap: .25rem; }
+.device-step-volume > span { min-width: 3rem; text-align: center; font-size: .8125rem; font-variant-numeric: tabular-nums; }
+.device-step-volume svg { width: 16px; }
+.source-controls { padding: .5rem 0; }
+.output-routing-actions { margin-top: 1rem; }
+.transfer-section { border-top: 1px solid var(--line); padding-top: 1.25rem; margin-top: 1.5rem; }
+.transfer-section h3 { font-size: 1rem; }
+.transfer-destination { display: grid; gap: .5rem; font-size: .8125rem; margin: 1rem 0; }
+.pause-all-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .5rem; border-top: 1px solid var(--line); margin-top: 1.5rem; padding-top: 1rem; }
+.output-dialog-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .75rem; border-top: 1px solid var(--line); padding: 1rem 1.5rem; }
+.output-dialog-footer .notice { width: 100%; margin: 0; }
+.native-listening .audio-heading { flex-wrap: wrap; }
+.native-listening h2 { display: flex; gap: .5rem; align-items: center; }
+.native-listening h2 svg { width: 18px; flex: none; }
+.native-intro { font-size: .875rem; line-height: 1.6; }
+.native-status { padding-left: .75rem; border-left: 2px solid var(--accent); }
+.native-details { margin-top: 1rem; font-size: .75rem; color: var(--muted); }
+.native-details summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; }
 .dialog-overlay { position: fixed; inset: 0; z-index: 30; background: #2b292673; }
+@starting-style {
+  html[data-input="pointer"] .output-dialog[data-state="open"] { opacity: 0; transform: translate(-50%, calc(-50% + 8px)) scale(.98); }
+  html[data-input="pointer"] .dialog-overlay[data-state="open"] { opacity: 0; }
+}
+html[data-input="pointer"] .output-dialog { transition: transform 180ms var(--ease-out), opacity 180ms var(--ease-out); }
+html[data-input="pointer"] .dialog-overlay { transition: opacity 160ms var(--ease-out); }
 .login-dialog { position: fixed; z-index: 31; top: 50%; left: 50%; transform: translate(-50%, -50%); overflow-y: auto; width: min(440px, calc(100% - 32px)); max-height: calc(100dvh - 32px); padding: 2rem; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); color: var(--text); box-shadow: 0 16px 80px #2b29262b; }
 .login-dialog form { display: grid; gap: 1.25rem; }
 .login-dialog h2 { font-size: 1.5rem; letter-spacing: -.035em; }
@@ -271,6 +325,7 @@ html[data-input="keyboard"] *, html[data-input="keyboard"] *::before, html[data-
   .player { grid-template-columns: 88px minmax(0, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) {
+  html[data-input="pointer"] .output-dialog, html[data-input="pointer"] .dialog-overlay { transition: none; }
   html[data-input="pointer"] button:not(:disabled):active { transform: none; }
   button:not(:disabled), summary { transition: background-color 100ms var(--ease-out), color 100ms var(--ease-out); }
 }

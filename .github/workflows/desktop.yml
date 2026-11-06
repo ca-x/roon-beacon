@@ -1,0 +1,110 @@
+name: Linux Desktop
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deb:
+    name: Debian ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf shairport-sync avahi-daemon xvfb
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+      - name: Check shared source and UI
+        run: |
+          npm --prefix web ci
+          npm --prefix web run check
+          npm --prefix desktop ci
+          cargo fmt --manifest-path desktop/Cargo.toml -- --check
+          cargo clippy --manifest-path desktop/Cargo.toml --all-targets -- -D warnings
+      - name: Build Debian package
+        run: npm --prefix desktop run build
+      - name: Inspect package and run installed payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          package=$(find desktop/target/release/bundle/deb -name '*.deb' -print -quit)
+          test -n "$package"
+          test "$(dpkg-deb -f "$package" Architecture)" = '${{ matrix.arch }}'
+          test "$(dpkg-deb -f "$package" Version)" = "$(node -p 'require("./desktop/package.json").version')"
+          dpkg-deb -f "$package" Depends | grep -q shairport-sync
+          dpkg-deb -f "$package" Depends | grep -q avahi-daemon
+          dpkg-deb --info "$package"
+          dpkg-deb --contents "$package"
+          mkdir -p package-root smoke-home
+          dpkg-deb -x "$package" package-root
+          test -x package-root/usr/bin/roon-beacon-desktop
+          test -n "$(find package-root/usr/share/applications -name '*.desktop' -print -quit)"
+          set +e
+          HOME="$PWD/smoke-home" XDG_DATA_HOME="$PWD/smoke-home/data" XDG_CONFIG_HOME="$PWD/smoke-home/config" \
+            timeout 20s dbus-run-session -- xvfb-run -a package-root/usr/bin/roon-beacon-desktop > desktop-smoke.log 2>&1
+          result=$?
+          set -e
+          cat desktop-smoke.log
+          test "$result" = 124
+          if grep -Ei 'panicked|cannot start roon beacon|error while loading shared libraries' desktop-smoke.log; then exit 1; fi
+      - name: Stage release assets
+        run: |
+          mkdir -p desktop-artifacts
+          version=$(node -p 'require("./desktop/package.json").version')
+          cp desktop/target/release/bundle/deb/*.deb "desktop-artifacts/roon-beacon-desktop_${version}_${{ matrix.arch }}.deb"
+          cd desktop-artifacts
+          sha256sum ./*.deb > roon-beacon-desktop-${{ matrix.arch }}.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roon-beacon-desktop-${{ matrix.arch }}
+          path: desktop-artifacts/*
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: deb
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: roon-beacon-desktop-*
+          merge-multiple: true
+          path: desktop-artifacts
+      - name: Attach Debian packages to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          if ! gh release view '${{ github.ref_name }}' >/dev/null 2>&1; then
+            gh release create '${{ github.ref_name }}' --title '${{ github.ref_name }}' --generate-notes || gh release view '${{ github.ref_name }}'
+          fi
+          gh release upload '${{ github.ref_name }}' desktop-artifacts/* --clobber

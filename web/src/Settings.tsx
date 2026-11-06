@@ -5,7 +5,7 @@ import { clockTime, errorMessage, request } from './api';
 import type { RuntimeConfig, Status } from './types';
 import { AudioNetworkSettings } from './AudioNetworkSettings';
 
-export function Settings({ status, statusError, locked, refresh }: { status?: Status; statusError?: string; locked: boolean; refresh: () => Promise<unknown> }) {
+export function Settings({ native = false, status, statusError, locked, refresh }: { native?: boolean; status?: Status; statusError?: string; locked: boolean; refresh: () => Promise<unknown> }) {
   const text = useText();
   const [config, setConfig] = useState<RuntimeConfig>({ name: '', broadcast_interval_secs: 0, live_proxy_timeout_ms: 500, reverse_proxy: false, proxy_ip: null });
   const [interval, setIntervalValue] = useState('0');
@@ -25,12 +25,12 @@ export function Settings({ status, statusError, locked, refresh }: { status?: St
   return <>
     <details id="settings" className="settings"><summary><SlidersHorizontal aria-hidden="true" /><span>{text('settings')}</span><span className="settings-meta" id="settingsMode">{text(mode)}</span></summary>
       <div className="settings-body">
-        <section aria-labelledby="signalHeading"><h2 id="signalHeading">{text('signal')}</h2>
+        <section hidden={native} aria-labelledby="signalHeading"><h2 id="signalHeading">{text('signal')}</h2>
           <dl className="signal-path"><div><dt>{text('local')}</dt><dd id="localIp">{status?.local_ip || '—'}</dd></div><div><dt>{text('remote')}</dt><dd id="remoteIp">{status?.remote_ip || text('standalone')}</dd></div><div><dt>{text('ports')}</dt><dd id="localPorts">{status?.sood_port ? `SOOD ${status.sood_port} · TCP ${status.discovery_port ?? '—'}` : '—'}</dd></div><div><dt>{text('mode')}</dt><dd id="mode">{text(status?.use_broadcast ? 'broadcast' : 'multicast')}</dd></div></dl>
           <dl className="metrics"><div><dt>{text('queries')}</dt><dd id="q">{status?.metrics?.sood_queries ?? '—'}</dd></div><div><dt>{text('live')}</dt><dd id="live">{status?.metrics?.live_core_responses ?? '—'}</dd></div><div><dt>{text('fallback')}</dt><dd id="fallback">{status?.metrics?.template_fallbacks ?? '—'}</dd></div><div><dt>{text('tcp')}</dt><dd id="tcp">{status?.metrics?.tcp_connections ?? '—'}</dd></div></dl>
           <Notice id="statusError" error={statusError} />
         </section>
-        <form id="configForm" onChange={() => { dirty.current = true; setFeedback(''); }} onSubmit={async (event) => {
+        <form hidden={native} id="configForm" onChange={() => { dirty.current = true; setFeedback(''); }} onSubmit={async (event) => {
           event.preventDefault();
           setSaving(true); setError(''); setFeedback(text('saving'));
           try {
@@ -48,7 +48,7 @@ export function Settings({ status, statusError, locked, refresh }: { status?: St
           <div className="inline-actions"><Button id="configSave" className="secondary" type="submit" disabled={saving || locked}>{text('save')}</Button><span id="feedback" className="small-note" role="status">{feedback}</span></div>
           <Notice id="configError" error={error} />
         </form>
-        <AudioNetworkSettings locked={locked} refresh={refresh} />
+        <AudioNetworkSettings native={native} locked={locked} refresh={refresh} />
       </div>
     </details>
     <footer><span>{text('footer')}</span><span><span id="version">{status?.version ? `v${status.version}` : ''}</span>{text('uptime')} <span id="uptime">{status ? clockTime(status.uptime_secs) : '—'}</span></span></footer>

@@ -1,0 +1,22 @@
+[package]
+name = "roon-beacon-desktop"
+version = "0.3.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Linux Roon remote and native AirPlay audio output"
+authors = ["Roon Beacon contributors <roon-beacon@users.noreply.github.com>"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+roon-beacon = { path = "../crates/roon-beacon" }
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["signal"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[workspace]

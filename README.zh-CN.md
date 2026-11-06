@@ -1,5 +1,23 @@
 # Roon Beacon
 
+## v0.3：Linux 桌面客户端与完整播放控制
+
+桌面端仅支持 Linux，发布 `amd64` / `arm64` 的 `.deb`。下载对应安装包后执行
+`sudo apt install ./roon-beacon*.deb`，APT 会处理 Shairport Sync、Avahi 和音频依赖。
+桌面采用 Tauri 2，继续使用现有 React、Cupertino、Radix 和 TanStack Query 界面，
+并复用 Rust 播放服务，而不是另写一套业务逻辑。
+
+在 Roon「设置 → 扩展」中启用 **Roon Beacon**，再到「设置 → 音频」的 AirPlay
+设备中启用 **Roon Beacon Desktop**，选择该分区即可向本机发送音乐。
+音频直接通过默认 ALSA 设备播放，不经过浏览器 MP3 转码，**不需要安装 Roon Bridge**。
+这是 AirPlay 输出，不是 RAAT，不保证高解析、DSD、bit-perfect 或多房间同步。
+
+Web 与桌面均增加循环/随机/Roon Radio、输出分组/拆分、播放转移、待机/音源控制、
+相对音量/进度操作和暂停所有分区。不支持的能力会禁用。详见 `desktop/README.md`。
+
+Web 音频的端到端测试与无声排查步骤见 `docs/audio-validation.md`。本地测试音通过，
+不等于之前无声的 Roon 部署已经修复；仍需现场诊断与验收。
+
 ## v0.2：Web 遥控与浏览器播放
 
 本版保留原有跨网络发现/转发，同时新增局域网 Roon Server 自动发现、扩展授权持久化、Web 播放遥控、媒体库浏览/搜索、专辑封面及实验性的浏览器音频输出。**它不是原生 RAAT/Roon Bridge 实现。**
@@ -19,7 +37,7 @@ docker compose exec roon-beacon cat /data/web-access-token
 
 访问 `http://<Docker宿主机IP>:9339`，输入上述 token。在 **Roon 设置 → 扩展** 中启用 **Roon Beacon**，然后在网页选择 Server 和播放区域。界面支持中文/English、播放暂停、切歌、进度跳转、音量、静音、媒体库和搜索；根据输出设备能力禁用不支持的操作。
 
-镜像地址：`ghcr.io/ca-x/roon-beacon:0.2.1`，支持 `linux/amd64` 与 `linux/arm64`。`latest` 跟随稳定版本，推荐固定版本或 digest。Compose 使用 `network_mode: host`，让 SOOD 与 AirPlay/mDNS 进入真实局域网；Docker Desktop 的普通 bridge 网络不能等价替代。
+镜像地址：`ghcr.io/ca-x/roon-beacon:0.3.0`，支持 `linux/amd64` 与 `linux/arm64`。`latest` 跟随稳定版本，推荐固定版本或 digest。Compose 使用 `network_mode: host`，让 SOOD 与 AirPlay/mDNS 进入真实局域网；Docker Desktop 的普通 bridge 网络不能等价替代。
 
 保留 `/data` 持久卷，它保存 Roon 授权和所选 Server。非 loopback Web 监听强制启用访问 token；没有设置时自动生成私有文件。可选环境变量 `ROON_BEACON_WEB_TOKEN`：16–256 个 ASCII 字母、数字、`-`、`_` 或 `.`。不要直接暴露公网，优先使用可信局域网、VPN 或 HTTPS 反向代理；代理需保留浏览器访问的 `Host`，以通过同源校验。
 

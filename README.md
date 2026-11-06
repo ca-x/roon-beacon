@@ -4,7 +4,28 @@ English | [简体中文](README.zh-CN.md)
 
 Roon Beacon publishes a remote Roon Core into your local LAN so Roon Remote and Control clients can discover and use it across network boundaries.
 
-Version 0.2 also discovers local Roon Servers, provides a browser-based music remote, and includes an experimental AirPlay-to-browser audio gateway. It is not a native RAAT/Roon Bridge implementation.
+Version 0.3 adds a Linux desktop client and expanded Roon transport controls, alongside the Web remote and discovery bridge. Audio uses AirPlay, not RAAT.
+
+## Linux Desktop
+
+Download the `amd64` or `arm64` `.deb` from the release and install it with
+`sudo apt install ./roon-beacon*.deb`. The desktop app keeps the existing React
+component stack and embeds the Rust player in a Linux-only Tauri window.
+
+Enable **Roon Beacon** in **Settings → Extensions**, then enable **Roon Beacon
+Desktop** in **Settings → Audio → AirPlay** and select it for playback. Audio
+goes directly to the system ALSA device without browser MP3 conversion. **Roon
+Bridge is not required**; the Debian package declares Shairport Sync and Avahi
+dependencies. This is not a RAAT/high-resolution/DSD or bit-perfect guarantee.
+
+Playback settings, compatible-output grouping, ungrouping, queue transfer,
+standby/source controls, relative volume/seek and pause-all are available in both
+interfaces. Unsupported capabilities stay disabled. See `desktop/README.md` for
+installation, dependencies, security and build instructions.
+
+Browser-audio test evidence and silent-stream troubleshooting are documented in
+`docs/audio-validation.md`. A passing local signal test is not a claim that a
+previously failing Roon deployment is fixed.
 
 ## Web Player and Docker
 
@@ -25,7 +46,7 @@ docker compose up -d
 docker compose exec roon-beacon cat /data/web-access-token
 ```
 
-Open `http://<docker-host-ip>:9339` and enter the generated token. The image is `ghcr.io/ca-x/roon-beacon:0.2.1`, with `linux/amd64` and `linux/arm64` support. `latest` tracks stable version tags; pin a version or digest for repeatable deployments. The container uses host networking for SOOD and AirPlay/mDNS discovery. Docker Desktop bridge networking is not an equivalent LAN multicast setup.
+Open `http://<docker-host-ip>:9339` and enter the generated token. The image is `ghcr.io/ca-x/roon-beacon:0.3.0`, with `linux/amd64` and `linux/arm64` support. `latest` tracks stable version tags; pin a version or digest for repeatable deployments. The container uses host networking for SOOD and AirPlay/mDNS discovery. Docker Desktop bridge networking is not an equivalent LAN multicast setup.
 
 The `/data` volume contains private authorization tokens and the selected Server. Keep it across container updates. Optionally set `ROON_BEACON_WEB_TOKEN` to a private 16–256-character token using ASCII letters, digits, `-`, `_`, or `.`. On a non-loopback Web bind, authentication is always enabled: a token is generated when none is configured. Do not expose this service directly to the Internet; use a trusted LAN, VPN, or HTTPS reverse proxy. Reverse proxies must preserve the browser-visible `Host` for same-origin checks.
 

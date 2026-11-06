@@ -11,6 +11,7 @@ FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 COPY --from=frontend /build/crates/roon-beacon/src/web ./crates/roon-beacon/src/web
 RUN cargo build --locked --release --bin roon-beacon
 
@@ -30,6 +31,8 @@ COPY docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY docker/avahi-daemon.conf /etc/avahi/avahi-daemon.conf
 COPY LICENSE /usr/share/doc/roon-beacon/LICENSE
 COPY web/THIRD_PARTY_NOTICES.md /usr/share/doc/roon-beacon/THIRD_PARTY_NOTICES.md
+COPY vendor/roon-api/LICENSE-MIT /usr/share/doc/roon-beacon/ROON-SDK-LICENSE-MIT
+COPY vendor/roon-api/LICENSE-APACHE /usr/share/doc/roon-beacon/ROON-SDK-LICENSE-APACHE
 RUN chmod 755 /usr/local/bin/docker-entrypoint.sh \
     && install -d -m 700 -o shairport-sync -g shairport-sync /data \
     && rm -f /etc/machine-id /var/lib/dbus/machine-id

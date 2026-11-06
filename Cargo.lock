@@ -1220,8 +1220,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "roon-api"
+version = "0.5.3"
+dependencies = [
+ "reqwest",
+ "roon-moo",
+ "roon-sood 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "roon-beacon"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1232,8 +1246,9 @@ dependencies = [
  "http-body-util",
  "if-addrs",
  "reqwest",
+ "roon-api",
  "roon-moo",
- "roon-sood",
+ "roon-sood 0.5.3",
  "serde",
  "serde_json",
  "socket2 0.5.10",
@@ -1272,6 +1287,20 @@ dependencies = [
  "proptest",
  "socket2 0.5.10",
  "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "roon-sood"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f666ab60b46546b33ca6821cd61dd385714a6a2bc3d19e52b5b53fd771b684c5"
+dependencies = [
+ "bytes",
+ "socket2 0.5.10",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "uuid",

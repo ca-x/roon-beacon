@@ -38,6 +38,11 @@ const RECEIVER_CONFIG: &str = r#"general = {
     mdns_backend = "avahi";
     playback_mode = "stereo";
 };
+stdout = {
+    output_format = "S16_LE";
+    output_rate = 44100;
+    output_channels = 2;
+};
 metadata = { enabled = "no"; };
 diagnostics = { log_output_to = "stderr"; };
 "#;
@@ -115,6 +120,7 @@ struct Runtime {
 
 #[derive(Clone, Debug, Serialize)]
 struct AudioStatus {
+    mode: &'static str,
     enabled: bool,
     available: bool,
     state: AudioState,
@@ -186,9 +192,33 @@ impl AudioGateway {
         receiver: PathBuf,
         encoder: PathBuf,
     ) -> Result<Self> {
+        Self::start_receiver(enabled, name, data_dir, receiver, encoder, false).await
+    }
+
+    pub async fn start_native(name: String, data_dir: PathBuf) -> Result<Self> {
+        Self::start_receiver(
+            true,
+            name,
+            data_dir,
+            PathBuf::from("shairport-sync"),
+            PathBuf::new(),
+            true,
+        )
+        .await
+    }
+
+    async fn start_receiver(
+        enabled: bool,
+        name: String,
+        data_dir: PathBuf,
+        receiver: PathBuf,
+        encoder: PathBuf,
+        native: bool,
+    ) -> Result<Self> {
         let shared = Arc::new(Shared {
             runtime: Mutex::new(Runtime {
                 status: AudioStatus {
+                    mode: if native { "native" } else { "browser" },
                     enabled,
                     available: false,
                     state: if enabled {
@@ -407,6 +437,10 @@ async fn run_pipeline(
     receiver_program: &std::path::Path,
     encoder_program: &std::path::Path,
 ) -> Result<PipelineExit> {
+    if shared.runtime().status.mode == "native" {
+        return run_native_pipeline(shared, stop, network, selection, data_dir, receiver_program)
+            .await;
+    }
     if !cfg!(target_endian = "little") {
         bail!("the Shairport stdout gateway requires a little-endian host");
     }
@@ -461,6 +495,53 @@ async fn run_pipeline(
 async fn terminate(child: &mut Child) {
     let _ = child.start_kill();
     let _ = child.wait().await;
+}
+
+async fn run_native_pipeline(
+    shared: &Shared,
+    stop: &mut watch::Receiver<bool>,
+    network: &mut watch::Receiver<NetworkSelection>,
+    selection: &NetworkSelection,
+    data_dir: &std::path::Path,
+    program: &std::path::Path,
+) -> Result<PipelineExit> {
+    let directory = data_dir.join("native-audio");
+    tokio::fs::create_dir_all(&directory).await?;
+    let config = directory.join("shairport-sync.conf");
+    let template = RECEIVER_CONFIG.replace(
+        "output_backend = \"stdout\";",
+        "output_backend = \"alsa\";\n    port = 5002;\n    udp_port_base = 6101;\n    udp_port_range = 10;",
+    );
+    tokio::fs::write(&config, selection.receiver_config(&template)?).await?;
+    if *stop.borrow() {
+        return Ok(PipelineExit::Stopped);
+    }
+    let name = shared.runtime().status.name.clone();
+    let mut receiver = Command::new(program)
+        .arg("-c").arg(config).args(["-o", "alsa", "-m", "avahi", "-a", &name])
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped())
+        .kill_on_drop(true).spawn()
+        .with_context(||format!("Cannot start native AirPlay receiver {}. Install shairport-sync and ensure avahi-daemon is running", program.display()))?;
+    let stderr = receiver.stderr.take().context("receiver stderr missing")?;
+    {
+        let mut runtime = shared.runtime();
+        runtime.status.available = true;
+        runtime.status.state = AudioState::Waiting;
+    }
+    let errors = capture_stderr(stderr, |message| {
+        shared.runtime().status.receiver_diagnostics = Some(message.to_owned());
+    });
+    tokio::pin!(errors);
+    let result = tokio::select! {
+        biased;
+        _ = stop.changed() => Ok(PipelineExit::Stopped),
+        _ = network.changed() => Ok(PipelineExit::Reconfigure),
+        diagnostic = &mut errors => Err(anyhow::anyhow!("Native AirPlay receiver stopped: {diagnostic:?}")),
+        status = receiver.wait() => Err(anyhow::anyhow!("Native AirPlay receiver exited: {status:?}")),
+    };
+    terminate(&mut receiver).await;
+    shared.runtime().status.available = false;
+    result
 }
 
 async fn transfer_audio(
@@ -638,6 +719,7 @@ mod tests {
         assert_eq!(
             status(&gateway).await,
             serde_json::json!({
+                "mode": "browser",
                 "enabled": false, "available": false, "state": "disabled",
                 "name": "Test output", "listeners": 0, "bytes_streamed": 0, "error": null,
                 "pcm_bytes_received": 0, "receiver_diagnostics": null, "encoder_diagnostics": null
@@ -870,6 +952,9 @@ mod tests {
         let config =
             std::fs::read_to_string(directory.path().join("audio/shairport-sync.conf")).unwrap();
         assert!(config.contains(&format!("interface = \"{}\";", interface.name)));
+        assert!(config.contains("output_format = \"S16_LE\""));
+        assert!(config.contains("output_rate = 44100"));
+        assert!(config.contains("output_channels = 2"));
         let mut stream = audio_stream(State(gateway.clone())).await.into_body();
         gateway
             .inner
@@ -921,6 +1006,75 @@ mod tests {
             .status()
             .unwrap()
             .success()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_receiver_uses_alsa_without_encoder_and_reaps_on_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("native.pid");
+        let args_path = directory.path().join("native.args");
+        let receiver = script(directory.path(), "native-receiver", &format!(
+            "printf '%s\\n' \"$@\" > '{}'\necho $$ > '{}'\necho 'native diagnostic' >&2\nexec sleep 60", args_path.display(), pid_path.display()
+        ));
+        let gateway = AudioGateway::start_receiver(
+            true,
+            "Native test".to_string(),
+            directory.path().to_path_buf(),
+            receiver,
+            directory.path().join("must-not-start"),
+            true,
+        )
+        .await
+        .unwrap();
+        wait_for_state(&gateway, AudioState::Waiting).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !pid_path.exists() || gateway.inner.shared.status().receiver_diagnostics.is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let state = status(&gateway).await;
+        assert_eq!(state["mode"], "native");
+        assert_eq!(state["available"], true);
+        assert_eq!(state["bytes_streamed"], 0);
+        let arguments = std::fs::read_to_string(args_path).unwrap();
+        assert!(arguments.contains("-o\nalsa\n"));
+        assert!(!arguments.contains("stdout"));
+        let config =
+            std::fs::read_to_string(directory.path().join("native-audio/shairport-sync.conf"))
+                .unwrap();
+        assert!(config.contains("output_backend = \"alsa\""));
+        assert!(config.contains("port = 5002"));
+        assert!(config.contains("udp_port_base = 6101"));
+        let pid = std::fs::read_to_string(pid_path).unwrap();
+        assert!(process_exists(&pid));
+        tokio::join!(gateway.shutdown(), gateway.shutdown());
+        assert!(!process_exists(&pid));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_receiver_reports_missing_dependency_and_does_not_claim_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = AudioGateway::start_receiver(
+            true,
+            "Native test".to_string(),
+            directory.path().to_path_buf(),
+            directory.path().join("missing-shairport-sync"),
+            PathBuf::new(),
+            true,
+        )
+        .await
+        .unwrap();
+        wait_for_state(&gateway, AudioState::Error).await;
+        let state = status(&gateway).await;
+        assert_eq!(state["available"], false);
+        assert_eq!(state["mode"], "native");
+        assert!(state["error"].as_str().unwrap().contains("avahi-daemon"));
+        gateway.shutdown().await;
     }
 
     #[cfg(unix)]

@@ -19,6 +19,9 @@ export interface Output {
   output_id: string;
   display_name: string;
   volume?: Volume;
+  zone_id?: string;
+  can_group_with_output_ids?: string[];
+  source_controls?: { control_key: string; display_name: string; status: string; supports_standby?: boolean }[];
 }
 
 export interface Track {
@@ -42,6 +45,9 @@ export interface Zone {
   seek_position?: number;
   now_playing?: Track | null;
   outputs?: Output[];
+  settings?: { shuffle: boolean; loop: 'disabled' | 'loop' | 'loop_one'; auto_radio: boolean } | null;
+  queue_items_remaining?: number;
+  queue_time_remaining?: number;
   [field: string]: unknown;
 }
 
@@ -49,6 +55,7 @@ export interface Player {
   cores: Core[];
   selected_core_id: string | null;
   zones: Zone[];
+  outputs?: Output[];
   discovery_error?: string | null;
 }
 
@@ -101,6 +108,7 @@ export interface Status {
 }
 
 export interface AudioStatus {
+  mode?: 'browser' | 'native';
   enabled: boolean;
   available: boolean;
   state: string;

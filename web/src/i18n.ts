@@ -1,5 +1,8 @@
+import { transportCopy } from './transport-i18n';
+
 export const copy = {
   en: {
+    ...transportCopy.en,
     audioNetwork: 'Browser audio network', audioInterface: 'AirPlay receiver interface',
     audioNetworkHint: 'Choose the LAN interface reachable by Roon. This only restarts the audio receiver; Core discovery and phone playback controls are unchanged. The Web domain is not the AirPlay address.',
     audioNetworkAuto: 'Automatic', audioNetworkMissing: 'Unavailable',
@@ -58,6 +61,7 @@ export const copy = {
     invalidResponse: 'Beacon returned an invalid response.', authExpired: 'Your session expired. Unlock this remote again.'
   },
   zh: {
+    ...transportCopy.zh,
     audioNetwork: '浏览器音频网络', audioInterface: 'AirPlay 接收网卡',
     audioNetworkHint: '选择 Roon 能访问的局域网网卡。保存仅重启音频接收器，不影响 Core 发现和手机播放控制。Web 域名不是 AirPlay 音频地址。',
     audioNetworkAuto: '自动选择', audioNetworkMissing: '不可用',

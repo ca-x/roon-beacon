@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 import { Music2, SkipBack, SkipForward, Play, Pause, Square, Volume2, VolumeX } from 'lucide-react';
 import { RemoteRange } from './RemoteRange';
+import { TransportTools } from './TransportTools';
 import { Button, Notice, useText } from './ui';
 import { clockTime, errorMessage, request } from './api';
 import type { Output, Zone } from './types';
@@ -34,7 +35,7 @@ function OutputVolume({ coreId, zone, output, ready, refresh, onError, isCurrent
         aria-label={text(volume?.is_muted ? 'unmute' : 'mute', { name: output.display_name })}
         aria-pressed={muteSupported ? volume?.is_muted : undefined} onClick={async () => {
           setMuting(true);
-          try { await request('/api/player/mute', { output_id: output.output_id, is_muted: !volume?.is_muted }); await refresh(); }
+          try { await request('/api/player/mute', { core_id: coreId, output_id: output.output_id, is_muted: !volume?.is_muted }); await refresh(); }
           catch (error) { onError(error); } finally { setMuting(false); }
         }}>{volume?.is_muted ? <VolumeX aria-hidden="true" /> : <Volume2 aria-hidden="true" />}</Button>
       <RemoteRange id={id} label={text('outputVolume', { name: output.display_name })} context={context}
@@ -42,7 +43,7 @@ function OutputVolume({ coreId, zone, output, ready, refresh, onError, isCurrent
         value={adjustable ? Math.max(volume!.min, Math.min(volume!.max, volume!.value)) : 0} disabled={!ready || !adjustable}
         format={format} onError={onError} commit={async (value, current) => {
           if (!ready || current !== context || !isCurrent(current)) return;
-          await request('/api/player/volume', { output_id: output.output_id, value });
+          await request('/api/player/volume', { core_id: coreId, output_id: output.output_id, value });
           await refresh();
         }}>{(value) => <output htmlFor={id}>{adjustable ? format(value) : '—'}</output>}</RemoteRange>
     </div>
@@ -50,7 +51,7 @@ function OutputVolume({ coreId, zone, output, ready, refresh, onError, isCurrent
   </div>;
 }
 
-export function PlayerPanel({ coreId, zone, ready, refresh }: { coreId: string | null; zone?: Zone; ready: boolean; refresh: () => Promise<unknown> }) {
+export function PlayerPanel({ coreId, zone, zones, outputs, ready, refresh }: { coreId: string | null; zone?: Zone; zones: Zone[]; outputs: Output[]; ready: boolean; refresh: () => Promise<unknown> }) {
   const text = useText();
   const live = useRef({ coreId, zone, ready });
   live.current = { coreId, zone, ready };
@@ -73,7 +74,7 @@ export function PlayerPanel({ coreId, zone, ready, refresh }: { coreId: string |
     if (!zone || !controlReady) return;
     setPending(true);
     setError('');
-    try { await request('/api/player/control', { zone_id: zone.zone_id, control: command }); await refresh(); }
+    try { await request('/api/player/control', { core_id: coreId, zone_id: zone.zone_id, control: command }); await refresh(); }
     catch (failure) { onError(failure); } finally { setPending(false); }
   };
   const context = seekContext(coreId, zone);
@@ -92,7 +93,7 @@ export function PlayerPanel({ coreId, zone, ready, refresh }: { coreId: string |
           const currentState = live.current;
           if (!currentState.ready || !currentState.zone?.is_seek_allowed || current !== seekContext(currentState.coreId, currentState.zone)) return;
           setError('');
-          await request('/api/player/seek', { zone_id: currentState.zone.zone_id, seconds });
+          await request('/api/player/seek', { core_id: currentState.coreId, zone_id: currentState.zone.zone_id, seconds });
           await refresh();
         }}>{(value) => <div className="time-labels"><span id="elapsed">{clockTime(value)}</span><span id="duration">{clockTime(length)}</span></div>}</RemoteRange>
       <p id="seekHint" className="sr-only">{text('seekHint')}</p>
@@ -103,6 +104,7 @@ export function PlayerPanel({ coreId, zone, ready, refresh }: { coreId: string |
       <Button id="next" className="icon-button" aria-label={text('next')} disabled={!controlReady || !zone?.is_next_allowed} onClick={() => control('next')}><SkipForward aria-hidden="true" /></Button>
       <Button id="stop" className="icon-button stop-button" aria-label={text('stop')} disabled={!controlReady || !['playing', 'paused', 'loading'].includes(zone?.state || '')} onClick={() => control('stop')}><Square aria-hidden="true" /></Button>
     </div>
+    <TransportTools key={`${coreId}:${zone?.zone_id}`} coreId={coreId} zone={zone} zones={zones} outputs={outputs} ready={ready} refresh={refresh} />
     <div className="output-volumes"><h3>{text('roonVolume')}</h3><p className="small-note" hidden={Boolean(zone?.outputs?.length)}>{text('noVolume')}</p><div id="volumeControls">
       {zone?.outputs?.map((output) => <OutputVolume key={output.output_id} coreId={coreId} zone={zone} output={output} ready={ready} refresh={refresh} onError={onError} isCurrent={(current) => {
         const currentState = live.current;

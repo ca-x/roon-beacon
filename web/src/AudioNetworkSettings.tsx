@@ -4,7 +4,7 @@ import { Button, Notice, useText } from './ui';
 import { errorMessage, request } from './api';
 import type { AudioNetwork } from './types';
 
-export function AudioNetworkSettings({ locked, refresh }: { locked: boolean; refresh: () => Promise<unknown> }) {
+export function AudioNetworkSettings({ native = false, locked, refresh }: { native?: boolean; locked: boolean; refresh: () => Promise<unknown> }) {
   const text = useText();
   const network = useQuery({ queryKey: ['audio-network'], enabled: !locked, refetchInterval: 5000,
     queryFn: ({ signal }) => request<AudioNetwork>('/api/audio/network', undefined, signal) });
@@ -24,8 +24,8 @@ export function AudioNetworkSettings({ locked, refresh }: { locked: boolean; ref
       await refresh();
     } catch (failure) { setError(errorMessage(failure)); } finally { setSaving(false); }
   }}>
-    <h2 id="audioNetworkHeading">{text('audioNetwork')}</h2>
-    <p id="audioNetworkHint" className="small-note">{text('audioNetworkHint')}</p>
+    <h2 id="audioNetworkHeading">{text(native ? 'nativeNetwork' : 'audioNetwork')}</h2>
+    <p id="audioNetworkHint" className="small-note">{text(native ? 'nativeNetworkHint' : 'audioNetworkHint')}</p>
     <label className="field" htmlFor="audioNetworkSelect"><span>{text('audioInterface')}</span>
       <select id="audioNetworkSelect" value={selected} disabled={locked || saving || !network.data} aria-describedby="audioNetworkHint" onChange={(event) => {
         setEditing(event.target.value); setSaved(false); setError('');
