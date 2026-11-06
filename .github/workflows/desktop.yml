@@ -60,6 +60,7 @@ jobs:
           test "$(dpkg-deb -f "$package" Version)" = "$(node -p 'require("./desktop/package.json").version')"
           dpkg-deb -f "$package" Depends | grep -q shairport-sync
           dpkg-deb -f "$package" Depends | grep -q avahi-daemon
+          dpkg-deb -f "$package" Depends | grep -Fq 'libc6 (>= 2.39)'
           dpkg-deb --info "$package"
           dpkg-deb --contents "$package"
           mkdir -p package-root smoke-home

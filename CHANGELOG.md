@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.3.0 — 2026-11-06
+## 0.3.1 — 2026-11-07
+
+- Declare the desktop's actual minimum glibc dependency (2.39) so APT rejects
+  incompatible systems instead of installing an executable that cannot start.
+- Document Ubuntu 24.04 / Debian 13 desktop compatibility and older-system
+  source-build or Web/Docker alternatives.
+- Fix the audio lifecycle test race: a spawned child is not proof its PID file
+  exists yet. Synchronize PID publication and exercise deliberately delayed startup.
+
+## 0.3.0 — 2026-11-06 (GitHub release candidate, unpublished)
 
 - Add a Linux desktop application and amd64/arm64 Debian packages.
 - Add direct ALSA AirPlay reception without installing Roon Bridge or using the

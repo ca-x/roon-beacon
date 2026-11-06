@@ -6,6 +6,13 @@ is required. The desktop process embeds the same Rust player as the Web service.
 
 ## Install
 
+Prebuilt packages target Ubuntu 24.04 or compatible systems with glibc 2.39 or
+newer and WebKitGTK 4.1 (for example Debian 13). Debian 12 and Ubuntu 22.04 are
+not compatible with these binaries; build from source or use the Web/Docker
+edition instead. APT enforces the declared minimum libc version.
+When building on an older distribution, run the resulting executable directly
+or adjust the package's libc dependency to match that build's actual ABI.
+
 Download the `.deb` matching your machine (`amd64` or `arm64`) from the release,
 then run `sudo apt install ./roon-beacon*.deb`. Use APT rather than `dpkg -i` so
 that Shairport Sync, Avahi and system audio dependencies are resolved.

@@ -2963,7 +2963,7 @@ dependencies = [
 
 [[package]]
 name = "roon-beacon"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2989,7 +2989,7 @@ dependencies = [
 
 [[package]]
 name = "roon-beacon-desktop"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "roon-beacon",
  "tauri",

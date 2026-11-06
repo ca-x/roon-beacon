@@ -907,15 +907,24 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let receiver_pid = directory.path().join("network-receiver.pid");
         let encoder_pid = directory.path().join("network-encoder.pid");
+        let startup_gate = directory.path().join("start-children");
         let receiver = script(
             directory.path(),
             "receiver",
-            &format!("echo $$ > '{}'\nexec sleep 60", receiver_pid.display()),
+            &format!(
+                "while [ ! -e '{}' ]; do sleep 0.01; done\necho $$ > '{}'\nexec sleep 60",
+                startup_gate.display(),
+                receiver_pid.display()
+            ),
         );
         let encoder = script(
             directory.path(),
             "encoder",
-            &format!("echo $$ > '{}'\nexec sleep 60", encoder_pid.display()),
+            &format!(
+                "while [ ! -e '{}' ]; do sleep 0.01; done\necho $$ > '{}'\nexec sleep 60",
+                startup_gate.display(),
+                encoder_pid.display()
+            ),
         );
         std::fs::write(
             directory.path().join("audio-network.json"),
@@ -947,8 +956,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let first_receiver = std::fs::read_to_string(&receiver_pid).unwrap();
-        let first_encoder = std::fs::read_to_string(&encoder_pid).unwrap();
+        assert!(!receiver_pid.exists());
+        assert!(!encoder_pid.exists());
+        std::fs::write(&startup_gate, b"ready").unwrap();
+        let (first_receiver, first_encoder) = tokio::join!(
+            wait_for_pid(&receiver_pid, None),
+            wait_for_pid(&encoder_pid, None)
+        );
         let config =
             std::fs::read_to_string(directory.path().join("audio/shairport-sync.conf")).unwrap();
         assert!(config.contains(&format!("interface = \"{}\";", interface.name)));
@@ -962,15 +976,13 @@ mod tests {
             .save(NetworkSelection::default())
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if std::fs::read_to_string(&receiver_pid).unwrap() != first_receiver
-                    && gateway.inner.shared.status().available
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        let (last_receiver, last_encoder) = tokio::time::timeout(Duration::from_secs(3), async {
+            let pids = tokio::join!(
+                wait_for_pid(&receiver_pid, Some(&first_receiver)),
+                wait_for_pid(&encoder_pid, Some(&first_encoder))
+            );
+            wait_for_state(&gateway, AudioState::Waiting).await;
+            pids
         })
         .await
         .unwrap();
@@ -981,8 +993,6 @@ mod tests {
             std::fs::read_to_string(directory.path().join("audio/shairport-sync.conf")).unwrap(),
             RECEIVER_CONFIG
         );
-        let last_receiver = std::fs::read_to_string(&receiver_pid).unwrap();
-        let last_encoder = std::fs::read_to_string(&encoder_pid).unwrap();
         gateway.shutdown().await;
         assert!(!process_exists(&last_receiver));
         assert!(!process_exists(&last_encoder));
@@ -1006,6 +1016,24 @@ mod tests {
             .status()
             .unwrap()
             .success()
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pid(path: &std::path::Path, previous: Option<&str>) -> String {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(pid) = tokio::fs::read_to_string(path).await {
+                    if pid.trim().parse::<u32>().is_ok_and(|value| value > 1)
+                        && previous.is_none_or(|old| pid.trim() != old.trim())
+                    {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("waiting for child PID at {}", path.display()))
     }
 
     #[cfg(unix)]
@@ -1049,7 +1077,7 @@ mod tests {
         assert!(config.contains("output_backend = \"alsa\""));
         assert!(config.contains("port = 5002"));
         assert!(config.contains("udp_port_base = 6101"));
-        let pid = std::fs::read_to_string(pid_path).unwrap();
+        let pid = wait_for_pid(&pid_path, None).await;
         assert!(process_exists(&pid));
         tokio::join!(gateway.shutdown(), gateway.shutdown());
         assert!(!process_exists(&pid));
@@ -1228,8 +1256,8 @@ mod tests {
             .iter()
             .any(|sample| i16::from_le_bytes(*sample).unsigned_abs() > 100));
         assert!(gateway.inner.shared.status().bytes_streamed >= encoded.len() as u64);
-        let receiver_pid = std::fs::read_to_string(receiver_pid).unwrap();
-        let encoder_pid = std::fs::read_to_string(encoder_pid).unwrap();
+        let receiver_pid = wait_for_pid(&receiver_pid, None).await;
+        let encoder_pid = wait_for_pid(&encoder_pid, None).await;
         assert!(process_exists(&receiver_pid));
         assert!(process_exists(&encoder_pid));
         tokio::join!(gateway.shutdown(), gateway.shutdown());
@@ -1272,14 +1300,7 @@ mod tests {
         )
         .await
         .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !pid_file.exists() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let pid = wait_for_pid(&pid_file, None).await;
         let clone = gateway.clone();
         drop(gateway);
         assert!(process_exists(&pid));

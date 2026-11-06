@@ -11,6 +11,9 @@ Version 0.3 adds a Linux desktop client and expanded Roon transport controls, al
 Download the `amd64` or `arm64` `.deb` from the release and install it with
 `sudo apt install ./roon-beacon*.deb`. The desktop app keeps the existing React
 component stack and embeds the Rust player in a Linux-only Tauri window.
+Prebuilt desktop packages require glibc 2.39 or newer and WebKitGTK 4.1
+(Ubuntu 24.04 / Debian 13 or compatible). Older systems can build from source
+or use the Web/Docker edition.
 
 Enable **Roon Beacon** in **Settings → Extensions**, then enable **Roon Beacon
 Desktop** in **Settings → Audio → AirPlay** and select it for playback. Audio
@@ -46,7 +49,7 @@ docker compose up -d
 docker compose exec roon-beacon cat /data/web-access-token
 ```
 
-Open `http://<docker-host-ip>:9339` and enter the generated token. The image is `ghcr.io/ca-x/roon-beacon:0.3.0`, with `linux/amd64` and `linux/arm64` support. `latest` tracks stable version tags; pin a version or digest for repeatable deployments. The container uses host networking for SOOD and AirPlay/mDNS discovery. Docker Desktop bridge networking is not an equivalent LAN multicast setup.
+Open `http://<docker-host-ip>:9339` and enter the generated token. The image is `ghcr.io/ca-x/roon-beacon:0.3.1`, with `linux/amd64` and `linux/arm64` support. `latest` tracks stable version tags; pin a version or digest for repeatable deployments. The container uses host networking for SOOD and AirPlay/mDNS discovery. Docker Desktop bridge networking is not an equivalent LAN multicast setup.
 
 The `/data` volume contains private authorization tokens and the selected Server. Keep it across container updates. Optionally set `ROON_BEACON_WEB_TOKEN` to a private 16–256-character token using ASCII letters, digits, `-`, `_`, or `.`. On a non-loopback Web bind, authentication is always enabled: a token is generated when none is configured. Do not expose this service directly to the Internet; use a trusted LAN, VPN, or HTTPS reverse proxy. Reverse proxies must preserve the browser-visible `Host` for same-origin checks.
 
