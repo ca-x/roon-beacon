@@ -26,6 +26,10 @@ Web 音频的端到端测试与无声排查步骤见 `docs/audio-validation.md`�
 
 前端采用 React、TypeScript、Vite 和 React Cupertino UI 组件；实现源码位于 `web/`，构建后的静态资源随 Rust 二进制嵌入。修改前端后运行 `npm --prefix web ci && npm --prefix web run check && npm --prefix web run build`，再执行 Cargo 构建。Docker 使用独立 Node 构建阶段，运行时不需要 Node 服务。
 
+应用根节点使用 SPEC-01 的 `Hardware` 外壳，保留现有 Cupertino 组件、主题和排版。Registry 配置位于 `web/components.json`，组件位于 `web/src/components/ui/hardware.tsx`；IBM Plex Mono 字体随静态资源内嵌，无需访问在线字体服务。
+交互音效默认关闭，不会在输入文字或控制音乐时自动发声。运行 `python3 tests/frontend_qa.py --hardware-only` 可检查皮肤兼容、键盘焦点、音效默认值和浏览器禁用存储时的启动行为。
+字体检查验证桌面配置中的字体策略兼容性，不替代实际 WebView 响应头或真机验收。
+
 界面使用项目提供的 Logo，支持中英文切换，以及浅色、深色、跟随系统三种主题；语言和主题选择保存在当前浏览器。
 
 浏览器回归测试：安装 `agent-browser` 及其 Chromium 后，运行 `python3 tests/frontend_qa.py`。测试使用隔离的 mock 服务，不会控制你的 Roon Server。
@@ -39,7 +43,7 @@ docker compose exec roon-beacon cat /data/web-access-token
 
 访问 `http://<Docker宿主机IP>:9339`，输入上述 token。在 **Roon 设置 → 扩展** 中启用 **Roon Beacon**，然后在网页选择 Server 和播放区域。界面支持中文/English、播放暂停、切歌、进度跳转、音量、静音、媒体库和搜索；根据输出设备能力禁用不支持的操作。
 
-镜像地址：`ghcr.io/ca-x/roon-beacon:0.3.1`，支持 `linux/amd64` 与 `linux/arm64`。`latest` 跟随稳定版本，推荐固定版本或 digest。Compose 使用 `network_mode: host`，让 SOOD 与 AirPlay/mDNS 进入真实局域网；Docker Desktop 的普通 bridge 网络不能等价替代。
+镜像地址：`ghcr.io/ca-x/roon-beacon:0.3.2`，支持 `linux/amd64` 与 `linux/arm64`。`latest` 跟随稳定版本，推荐固定版本或 digest。Compose 使用 `network_mode: host`，让 SOOD 与 AirPlay/mDNS 进入真实局域网；Docker Desktop 的普通 bridge 网络不能等价替代。
 
 保留 `/data` 持久卷，它保存 Roon 授权和所选 Server。非 loopback Web 监听强制启用访问 token；没有设置时自动生成私有文件。可选环境变量 `ROON_BEACON_WEB_TOKEN`：16–256 个 ASCII 字母、数字、`-`、`_` 或 `.`。不要直接暴露公网，优先使用可信局域网、VPN 或 HTTPS 反向代理；代理需保留浏览器访问的 `Host`，以通过同源校验。
 

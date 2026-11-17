@@ -42,6 +42,10 @@ Open `http://127.0.0.1:9339`, then enable **Roon Beacon** in **Roon Settings →
 
 The interface uses the supplied project logo, offers English/Chinese language switching, and supports light, dark, or system themes. Language and theme preferences are saved in the current browser.
 
+The app is wrapped in SPEC-01's `Hardware` component, with the registry configured in `web/components.json` and the component installed at `web/src/components/ui/hardware.tsx`. Existing Cupertino components, themes and typography are preserved. IBM Plex Mono is bundled into the embedded CSS, so no online font service is needed.
+Interaction sounds are opt-in and do not start automatically while typing or controlling playback. Run `python3 tests/frontend_qa.py --hardware-only` for focused skin, keyboard-focus, sound-default and blocked-storage regressions.
+Font checks validate compatibility with the desktop configuration, not effective native response headers.
+
 For Docker on Linux, use the included `compose.yml`:
 
 ```bash
@@ -49,7 +53,7 @@ docker compose up -d
 docker compose exec roon-beacon cat /data/web-access-token
 ```
 
-Open `http://<docker-host-ip>:9339` and enter the generated token. The image is `ghcr.io/ca-x/roon-beacon:0.3.1`, with `linux/amd64` and `linux/arm64` support. `latest` tracks stable version tags; pin a version or digest for repeatable deployments. The container uses host networking for SOOD and AirPlay/mDNS discovery. Docker Desktop bridge networking is not an equivalent LAN multicast setup.
+Open `http://<docker-host-ip>:9339` and enter the generated token. The image is `ghcr.io/ca-x/roon-beacon:0.3.2`, with `linux/amd64` and `linux/arm64` support. `latest` tracks stable version tags; pin a version or digest for repeatable deployments. The container uses host networking for SOOD and AirPlay/mDNS discovery. Docker Desktop bridge networking is not an equivalent LAN multicast setup.
 
 The `/data` volume contains private authorization tokens and the selected Server. Keep it across container updates. Optionally set `ROON_BEACON_WEB_TOKEN` to a private 16–256-character token using ASCII letters, digits, `-`, `_`, or `.`. On a non-loopback Web bind, authentication is always enabled: a token is generated when none is configured. Do not expose this service directly to the Internet; use a trusted LAN, VPN, or HTTPS reverse proxy. Reverse proxies must preserve the browser-visible `Host` for same-origin checks.
 

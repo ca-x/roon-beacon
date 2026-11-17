@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.2 — 2026-11-17
+
+- Add the SPEC-01 Hardware foundation while keeping the existing React/Cupertino
+  components, layout, languages and themes.
+- Bundle IBM Plex Mono locally and allow embedded fonts in the desktop content
+  security policy; no online font service is needed.
+- Preserve native checkboxes, select arrows, dark-theme borders and visible
+  keyboard focus when the Hardware skin is enabled.
+- Keep interaction sounds off unless explicitly enabled and prevent blocked
+  browser storage from stopping the application at startup.
+- Add focused Hardware compatibility and desktop font-policy regressions to the
+  browser suite, alongside the existing playback and output-control checks.
+
 ## 0.3.1 — 2026-11-07
 
 - Declare the desktop's actual minimum glibc dependency (2.39) so APT rejects

@@ -59,6 +59,23 @@
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 body { margin: 0; background: var(--bg); color: var(--text); min-height: 100dvh; }
+.beacon-hardware[data-skin="hardware"] {
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  --line: inherit;
+  min-height: 100dvh;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  text-transform: none;
+}
+.beacon-hardware[data-skin="hardware"] :is(input[type="checkbox"], input[type="radio"], select):not([data-kit], [data-kit] *) {
+  -webkit-appearance: auto;
+  appearance: auto;
+}
+.beacon-hardware[data-skin="hardware"] :focus-visible:not([data-kit], [data-kit] *) {
+  outline: 3px solid var(--accent);
+  outline-offset: 4px;
+}
 button, input, select { font: inherit; color: inherit; }
 button, select, summary { touch-action: manipulation; }
 button { display: inline-flex; align-items: center; justify-content: center; gap: .5rem; min-height: 44px; border: 1px solid transparent; border-radius: 8px; padding: .5rem .875rem; background: transparent; cursor: pointer; font-size: .875rem; font-weight: 600; }

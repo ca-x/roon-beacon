@@ -1,4 +1,7 @@
-"""Contract-fixture browser QA; run with python3 tests/frontend_qa.py from the repository root."""
+"""Contract-fixture browser QA; run with python3 tests/frontend_qa.py from the repository root.
+
+Font checks isolate the configured desktop font policy, not effective WebView headers.
+"""
 
 import argparse
 import json
@@ -13,6 +16,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB = ROOT / "crates/roon-beacon/src/web"
+DESKTOP_POLICY = json.loads((ROOT / "desktop/tauri.conf.json").read_text())["app"]["security"]["csp"]
+FONT_DIRECTIVES = dict(directive.strip().split(None, 1) for directive in DESKTOP_POLICY.split(";") if directive.strip())
+DESKTOP_FONT_CSP = "font-src " + FONT_DIRECTIVES.get("font-src", FONT_DIRECTIVES["default-src"])
 FIXTURE = {"scenario": "playing", "required": False, "requests": [], "position": 42, "volume": 36,
            "length": 255, "track_title": "A quiet afternoon", "zone_id": "zone-one", "output_id": "output-one"}
 
@@ -82,10 +88,17 @@ class Handler(BaseHTTPRequestHandler):
             if name not in {"index.html", "styles.css", "app.js", "logo.png", "favicon.png", "apple-touch-icon.png"}:
                 return self.reply({"error": "Not found"}, 404)
             content = (WEB / name).read_bytes()
+            if name == "index.html" and FIXTURE.get("hardware_qa"):
+                bootstrap = "window.__qaSoundContexts = 0; const NativeAudioContext = window.AudioContext; if (NativeAudioContext) window.AudioContext = class extends NativeAudioContext { constructor(...args) { super(...args); window.__qaSoundContexts += 1; } };"
+                if FIXTURE.get("blocked_storage"):
+                    bootstrap += "Object.defineProperty(window, 'localStorage', { get() { throw new DOMException('Storage disabled', 'SecurityError'); } });"
+                content = content.replace(b"<head>", f"<head><script>{bootstrap}</script>".encode(), 1)
             if name == "app.js":
                 content = b"Object.defineProperty(crypto, 'randomUUID', {value: undefined});\n" + content
             self.send_response(200)
             self.send_header("content-type", {"index.html": "text/html", "styles.css": "text/css", "app.js": "application/javascript"}.get(name, "image/png"))
+            if name == "index.html":
+                self.send_header("content-security-policy", DESKTOP_FONT_CSP)
             self.send_header("content-length", str(len(content)))
             self.end_headers()
             return self.wfile.write(content)
@@ -206,8 +219,10 @@ def main():
     parser.add_argument("--localization-only", action="store_true", help="Run focused Roon navigation, prompt, action and metadata localization regressions")
     parser.add_argument("--appearance-only", action="store_true", help="Check full theme labels at narrow widths and enlarged font sizes")
     parser.add_argument("--audio-network-only", action="store_true", help="Check audio network editing, persistence, errors and waiting feedback")
+    parser.add_argument("--hardware-only", action="store_true", help="Check SPEC-01 compatibility, opt-in sound and blocked browser storage")
     arguments = parser.parse_args()
     FIXTURE["navigation_fixture"] = arguments.localization_only
+    FIXTURE["hardware_qa"] = arguments.hardware_only or not (arguments.localization_only or arguments.appearance_only or arguments.audio_network_only)
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     origin = f"http://127.0.0.1:{server.server_port}"
@@ -252,6 +267,39 @@ def main():
         assert findings["success"] and findings["data"]["counts"]["violations"] == 0, raw
         assert findings["data"]["counts"]["incomplete"] == 0, raw
 
+    def hardware_regressions():
+        failures = []
+
+        def check(label, script):
+            try:
+                evaluate(script)
+            except AssertionError:
+                failures.append(label)
+
+        check("light theme border token", "assert(getComputedStyle(document.querySelector('[data-skin=hardware]')).getPropertyValue('--line').trim() === getComputedStyle(document.body).getPropertyValue('--line').trim(), 'Hardware must not shadow the app border color');")
+        browser("click", "#settings summary")
+        browser("wait", "#reverseProxy")
+        check("native checkbox and select appearance", "for (const selector of ['#reverseProxy', '#themeSelect']) assert(getComputedStyle(document.querySelector(selector)).appearance !== 'none', 'Native checkboxes and select arrows remain visible');")
+        browser("click", "#name")
+        browser("press", "a")
+        check("interaction sounds are opt-in", "assert(window.__qaSoundContexts === 0, 'Hardware must not create an audio context for ordinary typing without opt-in');")
+        browser("select", "#themeSelect", "dark")
+        browser("press", "Tab")
+        check("dark theme keyboard focus", "const control = document.querySelector('#themeSelect'); control.focus(); const probe = document.createElement('span'); probe.style.color = 'var(--accent)'; document.querySelector('[data-skin=hardware]').append(probe); const accent = getComputedStyle(probe).color; probe.remove(); assert(control.matches(':focus-visible') && getComputedStyle(control).outlineColor === accent, 'Native controls use a visible app accent focus ring in dark mode');")
+        check("dark theme border token", "assert(getComputedStyle(document.querySelector('[data-skin=hardware]')).getPropertyValue('--line').trim() === getComputedStyle(document.body).getPropertyValue('--line').trim(), 'Hardware follows the dark border token');")
+        try:
+            FIXTURE["blocked_storage"] = True
+            browser("reload")
+            wait()
+            check("boot with blocked browser storage", "assert(document.querySelector('[data-skin=hardware] #main'), 'The application boots when localStorage access throws');")
+        finally:
+            FIXTURE["blocked_storage"] = False
+            browser("reload")
+            browser("wait", "#browseItems button")
+            browser("select", "#themeSelect", "system")
+        assert not failures, f"Hardware regressions: {'; '.join(failures)}"
+        print("PASS: Hardware preserves native checkboxes, dark focus and theme tokens; sounds are opt-in; blocked storage does not prevent startup", flush=True)
+
     def audio_network_regressions():
         browser("click", "[data-lang=zh]")
         browser("click", "#settings summary")
@@ -293,7 +341,13 @@ def main():
 
     try:
         browser("open", origin)
+        browser("wait", "[data-skin=hardware] #main")
+        evaluate("const hardware = document.querySelector('#root > [data-skin=hardware]'); assert(hardware && hardware.contains(document.querySelector('.shell')), 'SPEC-01 Hardware wraps the application'); const style = getComputedStyle(hardware); assert(style.textTransform === 'none' && style.fontSize === getComputedStyle(document.documentElement).fontSize, 'Hardware preserves app typography and case'); assert(style.color === getComputedStyle(document.body).color && style.backgroundColor === getComputedStyle(document.body).backgroundColor, 'Hardware follows the app theme'); for (const weight of [200, 300, 400, 500]) { const faces = await document.fonts.load(`${weight} 12px \"IBM Plex Mono\"`); assert(faces.length > 0 && faces.every(face => face.status === 'loaded'), 'Hardware font is bundled and loads'); }")
         browser("wait", "#browseItems button")
+        if FIXTURE["hardware_qa"]:
+            hardware_regressions()
+            if arguments.hardware_only:
+                return
         if arguments.appearance_only:
             for width in (320, 375, 768, 1440):
                 browser("set", "viewport", str(width), "900")
